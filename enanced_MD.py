@@ -705,7 +705,7 @@ with tab1:
                     "Absolute Total Signups", 
                     f"{absolute_metrics['absolute_total_signups']:,}",
                     "Total signups since June 24, 2024",
-                    'navy',
+                    'blue',
                     '🚀'
                 ),
                 unsafe_allow_html=True
@@ -716,38 +716,90 @@ with tab1:
                             "Absolute Active Users",
                             f"{absolute_metrics['absolute_total_active_users']:,}",
                             "Total active users since June 24, 2024",
-                            'navy',
+                            'blue',
                             '⚡'
                         ),
                         unsafe_allow_html=True
                     )
-    
+
         st.subheader("📈 Comprehensive Metrics Overview")
-        # Core Metrics Row
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown(
-                create_metric_card(
-                    "First Time Users",
-                    f"{comprehensive_df['first_time_users'][0]:,}",
-                    "Registered users who used at least one feature",
-                    'blue',
-                    '🌟'
-                ),
-                unsafe_allow_html=True
-            )
+         # Period-Specific Metrics
+        if not comprehensive_df.empty:
+            # Row 1: Core Metrics
+            col1, col2, col3, col4 = st.columns(4)
+                
+            with col1:
+                st.markdown(
+                    create_metric_card(
+                        "Total Signups",
+                        f"{comprehensive_df['total_signups'][0]:,}",
+                        f"New signups from {start_date} to {end_date}",
+                        'navy',
+                        '👥'
+                    ),
+                    unsafe_allow_html=True
+                )
+                
+            with col2:
+                st.markdown(
+                    create_metric_card(
+                        "Total Active Users",
+                        f"{comprehensive_df['total_active_users'][0]:,}",
+                        f"Users active from {start_date} to {end_date}",
+                        'navy',
+                        '🎯'
+                    ),
+                    unsafe_allow_html=True
+                )
+
+            with col3:
+                st.markdown(
+                    create_metric_card(
+                        "First Time Users",
+                        f"{comprehensive_df['first_time_users'][0]:,}",
+                        "Registered users who used at least one feature",
+                        'navy',
+                            '🌟'
+                    ),
+                    unsafe_allow_html=True
+                )
+            with col4:
+                st.markdown(
+                    create_metric_card(
+                        "Recurring Users",
+                        f"{comprehensive_df['recurring_users'][0]:,}",
+                        "Users with multiple active days",
+                        'navy',
+                        '🔄'
+                    ),
+                    unsafe_allow_html=True
+                )
+    
+        # # Core Metrics Row
+        # col1, col2 = st.columns(2)
+        # with col1:
+        #     st.markdown(
+        #         create_metric_card(
+        #             "First Time Users",
+        #             f"{comprehensive_df['first_time_users'][0]:,}",
+        #             "Registered users who used at least one feature",
+        #             'blue',
+        #             '🌟'
+        #         ),
+        #         unsafe_allow_html=True
+        #     )
         
-        with col2:
-            st.markdown(
-                create_metric_card(
-                    "Recurring Users",
-                    f"{comprehensive_df['recurring_users'][0]:,}",
-                    "Users with multiple active days",
-                    'blue',
-                    '🔄'
-                ),
-                unsafe_allow_html=True
-            )
+        # with col2:
+        #     st.markdown(
+        #         create_metric_card(
+        #             "Recurring Users",
+        #             f"{comprehensive_df['recurring_users'][0]:,}",
+        #             "Users with multiple active days",
+        #             'blue',
+        #             '🔄'
+        #         ),
+        #         unsafe_allow_html=True
+        #     )
         
         # Row 2: Feature-Specific Metrics with Color Coding
         st.subheader("🎪 Feature Engagement")
@@ -806,7 +858,7 @@ with tab1:
     insights = generate_insights(comprehensive_df, retention_df)
     
     if insights:
-        st.subheader("💡 AI-Powered Insights")
+        st.subheader("💡 Retention Insights")
         for insight in insights:
             st.markdown(
                 create_insight_card(
@@ -817,9 +869,63 @@ with tab1:
                 ),
                 unsafe_allow_html=True
             )
+
+    # Additional Analytics Section
+    st.markdown('<div class="feature-section">', unsafe_allow_html=True)
+    st.subheader("📊 Cross-Feature Comparison")
+    
+    if not comprehensive_df.empty:
+        # Create comparison chart
+        feature_data = pd.DataFrame({
+            'Feature': ['Spending', 'Lady AI', 'Savings', 'Investment'],
+            'Active Users': [
+                comprehensive_df['spending_users'][0],
+                comprehensive_df['lady_ai_users'][0],
+                comprehensive_df['savings_users'][0],
+                comprehensive_df['investment_users'][0]
+            ],
+            'Colors': [LADDER_COLORS['blue'], LADDER_COLORS['orange'], LADDER_COLORS['green'], LADDER_COLORS['purple']]
+        })
+        
+        fig_comparison = px.bar(
+            feature_data,
+            x='Feature',
+            y='Active Users',
+            title="Feature Adoption Comparison",
+            color='Feature',
+            color_discrete_sequence=feature_data['Colors']
+        )
+        fig_comparison.update_layout(
+            showlegend=False,
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)'
+        )
+        st.plotly_chart(fig_comparison, use_container_width=True)
+        
+        # Feature penetration analysis
+        total_active = comprehensive_df['total_active_users'][0]
+        if total_active > 0:
+            penetration_data = pd.DataFrame({
+                'Feature': ['Spending', 'Lady AI', 'Savings', 'Investment'],
+                'Penetration %': [
+                    (comprehensive_df['spending_users'][0] / total_active) * 100,
+                    (comprehensive_df['lady_ai_users'][0] / total_active) * 100,
+                    (comprehensive_df['savings_users'][0] / total_active) * 100,
+                    (comprehensive_df['investment_users'][0] / total_active) * 100
+                ]
+            })
+            
+            fig_penetration = px.pie(
+                penetration_data,
+                values='Penetration %',
+                names='Feature',
+                title="Feature Penetration Among Active Users",
+                color_discrete_sequence=[LADDER_COLORS['blue'], LADDER_COLORS['orange'], LADDER_COLORS['green'], LADDER_COLORS['purple']]
+            )
+            fig_penetration.update_traces(textposition='inside', textinfo='percent+label')
+            st.plotly_chart(fig_penetration, use_container_width=True)
     
     st.markdown('</div>', unsafe_allow_html=True)
-
 # Feature-specific tabs
 for tab, feature, feature_name in [(tab2, 'spending', 'Spending'), (tab3, 'lady_ai', 'Lady AI'), (tab4, 'savings', 'Savings'), (tab5, 'investment', 'Investment')]:
     with tab:
@@ -1125,64 +1231,6 @@ with tab6:
     
     st.markdown('</div>', unsafe_allow_html=True)
 
-
-# Additional Analytics Section
-st.markdown('<div class="feature-section">', unsafe_allow_html=True)
-st.subheader("📊 Cross-Feature Comparison")
-
-if not comprehensive_df.empty:
-    # Create comparison chart
-    feature_data = pd.DataFrame({
-        'Feature': ['Spending', 'Lady AI', 'Savings', 'Investment'],
-        'Active Users': [
-            comprehensive_df['spending_users'][0],
-            comprehensive_df['lady_ai_users'][0],
-            comprehensive_df['savings_users'][0],
-            comprehensive_df['investment_users'][0]
-        ],
-        'Colors': [LADDER_COLORS['blue'], LADDER_COLORS['orange'], LADDER_COLORS['green'], LADDER_COLORS['purple']]
-    })
-    
-    fig_comparison = px.bar(
-        feature_data,
-        x='Feature',
-        y='Active Users',
-        title="Feature Adoption Comparison",
-        color='Feature',
-        color_discrete_sequence=feature_data['Colors']
-    )
-    fig_comparison.update_layout(
-        showlegend=False,
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)'
-    )
-    st.plotly_chart(fig_comparison, use_container_width=True)
-    
-    # Feature penetration analysis
-    total_active = comprehensive_df['total_active_users'][0]
-    if total_active > 0:
-        penetration_data = pd.DataFrame({
-            'Feature': ['Spending', 'Lady AI', 'Savings', 'Investment'],
-            'Penetration %': [
-                (comprehensive_df['spending_users'][0] / total_active) * 100,
-                (comprehensive_df['lady_ai_users'][0] / total_active) * 100,
-                (comprehensive_df['savings_users'][0] / total_active) * 100,
-                (comprehensive_df['investment_users'][0] / total_active) * 100
-            ]
-        })
-        
-        fig_penetration = px.pie(
-            penetration_data,
-            values='Penetration %',
-            names='Feature',
-            title="Feature Penetration Among Active Users",
-            color_discrete_sequence=[LADDER_COLORS['blue'], LADDER_COLORS['orange'], LADDER_COLORS['green'], LADDER_COLORS['purple']]
-        )
-        fig_penetration.update_traces(textposition='inside', textinfo='percent+label')
-        st.plotly_chart(fig_penetration, use_container_width=True)
-
-st.markdown('</div>', unsafe_allow_html=True)
-
 # Footer with summary stats
 st.markdown(f"""
 <div style="text-align: center; padding: 20px; margin-top: 30px; 
@@ -1259,6 +1307,7 @@ if not comprehensive_df.empty:
             unsafe_allow_html=True
         )
         
+
 
 
 
