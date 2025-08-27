@@ -58,6 +58,31 @@ def get_database_connection():
     except Exception as e:
         st.error(f"Database connection failed: {e}")
         return None
+# -------------------------------
+# Get FFP data
+# -------------------------------
+@st.cache_data
+def load_ffp_data():
+    """Load FFP data from PostgreSQL"""
+    try:
+        db_url = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+        engine = create_engine(db_url)
+        ffp_df = pd.read_sql("SELECT * FROM financial_simulator_v2", engine)
+        feedback_df = pd.read_sql("SELECT * FROM financial_simulator_reviews", engine)
+        return ffp_df, feedback_df
+    except Exception as e:
+        st.error(f"Failed to load FFP data: {e}")
+        return pd.DataFrame(), pd.DataFrame()
+
+def parse_ffp_metadata(metadata_str):
+    """Parse FFP metadata JSON"""
+    try:
+        parsed = json.loads(metadata_str)
+        if isinstance(parsed, dict) and "plan" in parsed:
+            return {item['question']: item['answer'] for item in parsed['plan'] if isinstance(item, dict)}
+    except Exception as e:
+        return {}
+    return {}
 
 # -------------------------------
 # Enhanced Styling Functions
@@ -1234,5 +1259,6 @@ if not comprehensive_df.empty:
             unsafe_allow_html=True
         )
         
+
 
 
