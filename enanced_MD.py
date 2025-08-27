@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import psycopg2
 import numpy as np
+import json
 
 # -------------------------------
 # Ladder Color Scheme
@@ -664,7 +665,7 @@ comprehensive_df = fetch_comprehensive_metrics(start_date, end_date)
 # -------------------------------
 # Main Dashboard - Overview Tab System
 # -------------------------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "💰 Spending Analytics", "🤖 Lady AI Analytics", "🏦 Savings Analytics", "📈 Investment Analytics"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📊 Overview", "💰 Spending Analytics", "🤖 Lady AI Analytics", "🏦 Savings Analytics", "📈 Investment Analytics", "📋 FFP Engagement"])
 
 with tab1:
     st.markdown('<div class="feature-section">', unsafe_allow_html=True)
@@ -1026,6 +1027,80 @@ for tab, feature, feature_name in [(tab2, 'spending', 'Spending'), (tab3, 'lady_
         
         st.markdown('</div>', unsafe_allow_html=True)
 
+# FFP Engagement Dashboard Tab
+with tab6:
+    st.markdown('<div class="feature-section">', unsafe_allow_html=True)
+    st.subheader("📋 Free Financial Plan (FFP) Engagement Dashboard")
+    st.markdown("Gain actionable insights into how users interact with the Free Financial Plan experience.")
+    
+    # Load FFP data
+    ffp_df, feedback_df = load_ffp_data()
+    
+    if not ffp_df.empty:
+        # Convert dates
+        ffp_df['created_at'] = pd.to_datetime(ffp_df['created_at'])
+        if not feedback_df.empty:
+            feedback_df['created_at'] = pd.to_datetime(feedback_df['created_at'])
+        
+        # Apply date filter
+        filtered_ffp = ffp_df[(ffp_df['created_at'].dt.date >= start_date) & (ffp_df['created_at'].dt.date <= end_date)]
+        filtered_feedback = feedback_df[(feedback_df['created_at'].dt.date >= start_date) & (feedback_df['created_at'].dt.date <= end_date)] if not feedback_df.empty else feedback_df
+        
+        # FFP Metrics
+        col1, col2 = st.columns(2)
+        with col1:
+            parsed_metadata = filtered_ffp['metadata'].apply(parse_ffp_metadata)
+            total_completed = parsed_metadata.apply(lambda x: len([v for v in x.values() if v not in (None, '', [], {})]))
+            completed_surveys = (total_completed == total_completed.max()).sum()
+            st.markdown(
+                create_metric_card(
+                    "✅ Completed Surveys",
+                    f"{completed_surveys:,}",
+                    f"All questions completed ({start_date} to {end_date})",
+                    'navy',
+                    '📋'
+                ),
+                unsafe_allow_html=True
+            )
+        
+        with col2:
+            st.markdown(
+                create_metric_card(
+                    "📥 Total Submissions",
+                    f"{len(filtered_ffp):,}",
+                    f"Total FFP submissions ({start_date} to {end_date})",
+                    'navy',
+                    '📊'
+                ),
+                unsafe_allow_html=True
+            )
+        
+        # Engagement Trends
+        st.subheader("📊 Engagement Over Time and User Feedback")
+        trend_df = filtered_ffp.groupby(filtered_ffp['created_at'].dt.date).size().reset_index(name='Submissions')
+        trend_df = trend_df.rename(columns={"created_at": "Date"})
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write("### Daily Submissions")
+            st.line_chart(trend_df.set_index("Date"))
+        
+        if not filtered_feedback.empty:
+            reaction_counts = filtered_feedback['reaction'].value_counts()
+            with col2:
+                st.subheader("💬 User Reactions")
+                st.bar_chart(reaction_counts)
+            
+            # User Comments
+            st.subheader("💭 User Feedback")
+            for _, row in filtered_feedback.iterrows():
+                st.markdown(f"- **{row['reaction'].capitalize()}** — {row['comment']} *(on {row['created_at'].date()})*")
+        else:
+            st.info("No feedback data available for the selected period.")
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
 # Additional Analytics Section
 st.markdown('<div class="feature-section">', unsafe_allow_html=True)
 st.subheader("📊 Cross-Feature Comparison")
@@ -1159,4 +1234,5 @@ if not comprehensive_df.empty:
             unsafe_allow_html=True
         )
         
+
 
