@@ -5,4 +5,4 @@ sqlalchemy
 python-dotenv
 psycopg2-binary
 numpy
-json
+pyarrow
