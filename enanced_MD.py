@@ -212,13 +212,13 @@ def fetch_comprehensive_metrics(start_date, end_date):
         SELECT ip.user_id::TEXT, DATE(t.updated_at), 'investment'
         FROM transactions t
         JOIN investment_plans ip ON ip.id = t.investment_plan_id
-        WHERE t.status = 'success' AND DATE(t.updated_at) BETWEEN %s AND %s
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) BETWEEN %s AND %s
         UNION
         -- Savings
         SELECT p.user_id::TEXT, DATE(t.updated_at), 'savings'
         FROM transactions t
         JOIN plans p ON p.id = t.plan_id
-        WHERE t.status = 'success' AND DATE(t.updated_at) BETWEEN %s AND %s
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) BETWEEN %s AND %s
         UNION
         -- Lady AI
         SELECT "user"::TEXT, DATE(created_at), 'lady_ai'
@@ -282,13 +282,13 @@ def fetch_feature_specific_metrics(start_date, end_date, feature):
             SELECT p.user_id::TEXT, DATE(t.updated_at) AS activity_date
             FROM transactions t
             JOIN plans p ON p.id = t.plan_id
-            WHERE t.status = 'success' AND DATE(t.updated_at) BETWEEN %s AND %s
+            WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) BETWEEN %s AND %s
         """,
         'investment': """
             SELECT ip.user_id::TEXT, DATE(t.updated_at) AS activity_date
             FROM transactions t
             JOIN investment_plans ip ON ip.id = t.investment_plan_id
-            WHERE t.status = 'success' AND DATE(t.updated_at) BETWEEN %s AND %s
+            WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) BETWEEN %s AND %s
         """,
         'lady_ai': """
             SELECT "user"::TEXT AS user_id, DATE(created_at) AS activity_date
@@ -386,13 +386,13 @@ def fetch_retention_metrics(start_date, end_date, feature=None):
                 SELECT p.user_id::TEXT, DATE(t.updated_at) AS activity_date
                 FROM transactions t
                 JOIN plans p ON p.id = t.plan_id
-                WHERE t.status = 'success' AND DATE(t.updated_at) BETWEEN %s AND %s
+                WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) BETWEEN %s AND %s
             """,
             'investment': """
                 SELECT ip.user_id::TEXT, DATE(t.updated_at) AS activity_date
                 FROM transactions t
                 JOIN investment_plans ip ON ip.id = t.investment_plan_id
-                WHERE t.status = 'success' AND DATE(t.updated_at) BETWEEN %s AND %s
+                WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) BETWEEN %s AND %s
             """,
             'lady_ai': """
                 SELECT "user"::TEXT AS user_id, DATE(created_at) AS activity_date
@@ -411,12 +411,12 @@ def fetch_retention_metrics(start_date, end_date, feature=None):
             SELECT ip.user_id::TEXT, DATE(t.updated_at)
             FROM transactions t
             JOIN investment_plans ip ON ip.id = t.investment_plan_id
-            WHERE t.status = 'success' AND DATE(t.updated_at) BETWEEN %s AND %s
+            WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) BETWEEN %s AND %s
             UNION
             SELECT p.user_id::TEXT, DATE(t.updated_at)
             FROM transactions t
             JOIN plans p ON p.id = t.plan_id
-            WHERE t.status = 'success' AND DATE(t.updated_at) BETWEEN %s AND %s
+            WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) BETWEEN %s AND %s
             UNION
             SELECT "user"::TEXT, DATE(created_at)
             FROM slack_message_dump WHERE DATE(created_at) BETWEEN %s AND %s
@@ -483,13 +483,13 @@ def fetch_trend_data(start_date, end_date, feature=None):
                 SELECT p.user_id::TEXT, DATE(t.updated_at) AS activity_date
                 FROM transactions t
                 JOIN plans p ON p.id = t.plan_id
-                WHERE t.status = 'success' AND DATE(t.updated_at) BETWEEN %s AND %s
+                WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) BETWEEN %s AND %s
             """,
             'investment': """
                 SELECT ip.user_id::TEXT, DATE(t.updated_at) AS activity_date
                 FROM transactions t
                 JOIN investment_plans ip ON ip.id = t.investment_plan_id
-                WHERE t.status = 'success' AND DATE(t.updated_at) BETWEEN %s AND %s
+                WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) BETWEEN %s AND %s
             """,
             'lady_ai': """
                 SELECT "user"::TEXT AS user_id, DATE(created_at) AS activity_date
@@ -508,12 +508,12 @@ def fetch_trend_data(start_date, end_date, feature=None):
             SELECT ip.user_id::TEXT, DATE(t.updated_at)
             FROM transactions t
             JOIN investment_plans ip ON ip.id = t.investment_plan_id
-            WHERE t.status = 'success' AND DATE(t.updated_at) BETWEEN %s AND %s
+            WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) BETWEEN %s AND %s
             UNION
             SELECT p.user_id::TEXT, DATE(t.updated_at)
             FROM transactions t
             JOIN plans p ON p.id = t.plan_id
-            WHERE t.status = 'success' AND DATE(t.updated_at) BETWEEN %s AND %s
+            WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) BETWEEN %s AND %s
             UNION
             SELECT "user"::TEXT, DATE(created_at)
             FROM slack_message_dump WHERE DATE(created_at) BETWEEN %s AND %s
@@ -665,12 +665,12 @@ if conn:
         SELECT ip.user_id::TEXT, DATE(t.updated_at)
         FROM transactions t
         JOIN investment_plans ip ON ip.id = t.investment_plan_id
-        WHERE t.status = 'success' AND DATE(t.updated_at) >= '2024-06-24'
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) >= '2024-06-24'
         UNION
         SELECT p.user_id::TEXT, DATE(t.updated_at)
         FROM transactions t
         JOIN plans p ON p.id = t.plan_id
-        WHERE t.status = 'success' AND DATE(t.updated_at) >= '2024-06-24'
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) >= '2024-06-24'
         UNION
         SELECT "user"::TEXT, DATE(created_at)
         FROM slack_message_dump WHERE DATE(created_at) >= '2024-06-24'
@@ -1256,3 +1256,4 @@ st.markdown(f"""
 
 
   
+
