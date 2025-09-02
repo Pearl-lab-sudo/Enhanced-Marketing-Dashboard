@@ -735,7 +735,7 @@ if conn:
         FROM slack_message_dump WHERE DATE(created_at) >= '2024-06-24'
     )
     SELECT 
-        (SELECT COUNT(*) FROM users WHERE DATE(created_at) >= '2024-06-24') AS absolute_total_signups,
+        (SELECT COUNT(*) FROM users WHERE DATE(created_at) >= '2024-06-24' AND restricted = false) AS absolute_total_signups,
         (SELECT COUNT(DISTINCT user_id) FROM feature_usage) AS absolute_total_active_users;
     """
 
@@ -1393,3 +1393,4 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
+
