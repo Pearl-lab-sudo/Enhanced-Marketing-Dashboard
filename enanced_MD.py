@@ -716,27 +716,29 @@ if conn:
     absolute_query = """
     WITH feature_usage AS (
         SELECT user_id::TEXT, DATE(created_at) AS activity_date
-        FROM budgets WHERE DATE(created_at) >= '2024-06-24'
+        FROM budgets WHERE DATE(created_at) >= '2024-01-24'
         UNION
         SELECT user_id::TEXT, DATE(created_at)
-        FROM manual_and_external_transactions WHERE DATE(created_at) >= '2024-06-24'
+        FROM manual_and_external_transactions WHERE DATE(created_at) >= '2024-01-24'
         UNION
         SELECT ip.user_id::TEXT, DATE(t.updated_at)
         FROM transactions t
         JOIN investment_plans ip ON ip.id = t.investment_plan_id
-        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) >= '2024-06-24'
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) >= '2024-01-24'
         UNION
         SELECT p.user_id::TEXT, DATE(t.updated_at)
         FROM transactions t
         JOIN plans p ON p.id = t.plan_id
-        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) >= '2024-06-24'
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) >= '2024-01-24'
         UNION
         SELECT "user"::TEXT, DATE(created_at)
-        FROM slack_message_dump WHERE DATE(created_at) >= '2024-06-24'
+        FROM slack_message_dump WHERE DATE(created_at) >= '2024-01-24'
     )
     SELECT 
         (SELECT COUNT(*) FROM users WHERE DATE(created_at) >= '2024-06-24' AND restricted = false) AS absolute_total_signups,
-        (SELECT COUNT(DISTINCT user_id) FROM feature_usage) AS absolute_total_active_users;
+        (SELECT COUNT(DISTINCT user_id) FROM feature_usage 
+            LEFT JOIN users u ON u.id::TEXT = fu.user_id
+            WHERE (u.restricted = false)) AS absolute_total_active_users;
     """
 
     engine = create_engine(db_url)
@@ -1393,4 +1395,5 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
+
 
