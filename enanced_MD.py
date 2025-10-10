@@ -213,75 +213,129 @@ def fetch_comprehensive_metrics(start_date, end_date):
         return pd.DataFrame()
 
     query = """
-    WITH users_filtered AS (
-        SELECT id::TEXT AS user_id, DATE(created_at) AS signup_date
-        FROM users
-        WHERE DATE(created_at) BETWEEN %s AND %s
-          AND restricted = false
+   WITH users_filtered AS (
+    SELECT id::TEXT AS user_id, DATE(created_at) AS signup_date
+    FROM users
+    WHERE restricted = false
     ),
-    
+
     all_feature_usage AS (
         -- Spending
         SELECT user_id::TEXT, DATE(created_at) AS activity_date, 'spending' AS feature
-        FROM budgets WHERE DATE(created_at) BETWEEN %s AND %s
+        FROM budgets
         UNION
         SELECT user_id::TEXT, DATE(created_at), 'spending'
-        FROM manual_and_external_transactions WHERE DATE(created_at) BETWEEN %s AND %s
+        FROM manual_and_external_transactions
         UNION
         -- Investment
         SELECT ip.user_id::TEXT, DATE(t.updated_at), 'investment'
         FROM transactions t
         JOIN investment_plans ip ON ip.id = t.investment_plan_id
-        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) BETWEEN %s AND %s
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar'
         UNION
         -- Savings
         SELECT p.user_id::TEXT, DATE(t.updated_at), 'savings'
         FROM transactions t
         JOIN plans p ON p.id = t.plan_id
-        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) BETWEEN %s AND %s
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar'
         UNION
         -- Lady AI
         SELECT "user"::TEXT, DATE(created_at), 'lady_ai'
-        FROM slack_message_dump WHERE DATE(created_at) BETWEEN %s AND %s
+        FROM slack_message_dump
     ),
-    
-    user_first_activity AS (
-        SELECT user_id, MIN(activity_date) AS first_activity_date
+
+    -- Step 1: Each user’s earliest feature usage ever (across all time)
+    first_ever_activity AS (
+        SELECT user_id, MIN(activity_date) AS first_ever_activity_date
         FROM all_feature_usage
         GROUP BY user_id
     ),
-    
-    first_time_users AS (
-        SELECT uf.user_id
-        FROM users_filtered uf
-        JOIN user_first_activity ufa ON uf.user_id = ufa.user_id
-        WHERE ufa.first_activity_date >= uf.signup_date
-    ),
-    
-    recurring_users AS (
-        SELECT user_id
+
+    -- Step 2: Each user’s activity summary within the selected period
+    user_activity_summary AS (
+        SELECT 
+            user_id,
+            COUNT(DISTINCT activity_date) AS active_days_in_period,
+            MIN(activity_date) AS first_activity_in_period,
+            MAX(activity_date) AS last_activity_in_period
         FROM all_feature_usage
+        WHERE activity_date BETWEEN %s AND %s
         GROUP BY user_id
-        HAVING COUNT(DISTINCT activity_date) > 1
+    ),
+
+    -- Step 3: Combine and classify
+    user_classification AS (
+        SELECT 
+            uas.user_id,
+            uf.signup_date,
+            fea.first_ever_activity_date,
+            uas.first_activity_in_period,
+            uas.active_days_in_period,
+            CASE
+                WHEN uas.active_days_in_period = 1 THEN 'one_time_usage'
+                WHEN uas.active_days_in_period >= 2 THEN 'recurring'
+                ELSE 'inactive'
+            END AS usage_type,
+            CASE
+                WHEN fea.first_ever_activity_date BETWEEN %s AND %s THEN TRUE
+                ELSE FALSE
+            END AS is_first_time_user
+        FROM user_activity_summary uas
+        JOIN users_filtered uf ON uf.user_id = uas.user_id
+        LEFT JOIN first_ever_activity fea ON fea.user_id = uas.user_id
+    ),
+
+    -- Step 4: DAU, WAU, MAU metrics
+    dau_metrics AS (
+        SELECT AVG(daily_count) AS avg_dau
+        FROM (
+            SELECT activity_date, COUNT(DISTINCT user_id) AS daily_count
+            FROM all_feature_usage
+            WHERE activity_date BETWEEN %s AND %s
+            GROUP BY activity_date
+        ) d
+    ),
+    wau_metrics AS (
+        SELECT AVG(weekly_count) AS avg_wau
+        FROM (
+            SELECT DATE_TRUNC('week', activity_date)::DATE AS week, COUNT(DISTINCT user_id) AS weekly_count
+            FROM all_feature_usage
+            WHERE activity_date BETWEEN %s AND %s
+            GROUP BY 1
+        ) w
+    ),
+    mau_metrics AS (
+        SELECT AVG(monthly_count) AS avg_mau
+        FROM (
+            SELECT DATE_TRUNC('month', activity_date)::DATE AS month, COUNT(DISTINCT user_id) AS monthly_count
+            FROM all_feature_usage
+            WHERE activity_date BETWEEN %s AND %s
+            GROUP BY 1
+        ) m
     )
-    
     SELECT
-        -- Overall metrics
-        (SELECT COUNT(*) FROM users_filtered) AS total_signups,
-        (SELECT COUNT(DISTINCT user_id) FROM all_feature_usage) AS total_active_users,
-        (SELECT COUNT(*) FROM first_time_users) AS first_time_users,
-        (SELECT COUNT(*) FROM recurring_users) AS recurring_users,
+    -- Core user metrics
+        (SELECT COUNT(*) FROM users WHERE restricted = false AND DATE(created_at) BETWEEN %s AND %s) AS total_signups,
+        (SELECT COUNT(DISTINCT user_id) FROM user_classification) AS total_active_users,
+        (SELECT COUNT(*) FROM user_classification WHERE usage_type = 'one_time_usage') AS one_time_usage_users,
+        (SELECT COUNT(*) FROM user_classification WHERE usage_type = 'recurring') AS recurring_users,
+        (SELECT COUNT(*) FROM user_classification WHERE is_first_time_user = TRUE) AS first_time_users,
         
-        -- Feature-specific active users
-        (SELECT COUNT(DISTINCT user_id) FROM all_feature_usage WHERE feature = 'spending') AS spending_users,
-        (SELECT COUNT(DISTINCT user_id) FROM all_feature_usage WHERE feature = 'savings') AS savings_users,
-        (SELECT COUNT(DISTINCT user_id) FROM all_feature_usage WHERE feature = 'investment') AS investment_users,
-        (SELECT COUNT(DISTINCT user_id) FROM all_feature_usage WHERE feature = 'lady_ai') AS lady_ai_users;
+        -- Engagement
+        (SELECT avg_dau FROM dau_metrics) AS avg_dau,
+        (SELECT avg_wau FROM wau_metrics) AS avg_wau,
+        (SELECT avg_mau FROM mau_metrics) AS avg_mau,
+ 
+        -- Feature-level usage
+        (SELECT COUNT(DISTINCT user_id) FROM all_feature_usage WHERE feature = 'spending' AND activity_date BETWEEN %s AND %s) AS spending_users,
+        (SELECT COUNT(DISTINCT user_id) FROM all_feature_usage WHERE feature = 'savings' AND activity_date BETWEEN %s AND %s) AS savings_users,
+        (SELECT COUNT(DISTINCT user_id) FROM all_feature_usage WHERE feature = 'investment' AND activity_date BETWEEN %s AND %s) AS investment_users,
+        (SELECT COUNT(DISTINCT user_id) FROM all_feature_usage WHERE feature = 'lady_ai' AND activity_date BETWEEN %s AND %s) AS lady_ai_users;
     """
 
     engine = create_engine(db_url)
     with engine.connect() as connection:
-        params = [start_date, end_date] * 6
+        params = [start_date, end_date] * 10  # Added 2 more for first_time_feature_users
         df = pd.read_sql_query(query, connection, params=tuple(params))
         return df
 
@@ -827,13 +881,29 @@ with tab1:
                     create_metric_card(
                         "First Time Users",
                         f"{comprehensive_df['first_time_users'][0]:,}",
-                        "Registered users who used at least one feature",
+                        "Users who used features for the first time in this period",
                         "navy",
                         "🌟",
                     ),
                     unsafe_allow_html=True,
                 )
             with col4:
+                st.markdown(
+                    create_metric_card(
+                        "One Time Usage Users",
+                        f"{comprehensive_df['one_time_usage_users'][0]:,}",
+                        "Users active on exactly one day",
+                        "navy",
+                        "📅",
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+        # Additional metrics row
+        if not comprehensive_df.empty:
+            col_add1, col_add2, col_add3 = st.columns(3)
+            
+            with col_add1:
                 st.markdown(
                     create_metric_card(
                         "Recurring Users",
@@ -844,34 +914,131 @@ with tab1:
                     ),
                     unsafe_allow_html=True,
                 )
+            
+            with col_add2:
+                # Calculate Signup Conversion Rate
+                total_signups = comprehensive_df['total_signups'][0]
+                first_time_users = comprehensive_df['first_time_users'][0]
+                conversion_rate = (first_time_users / total_signups * 100) if total_signups > 0 else 0
+                
+                st.markdown(
+                    create_metric_card(
+                        "Signup Conversion Rate",
+                        f"{conversion_rate:.1f}%",
+                        "% of registered users who used a feature",
+                        "green",
+                        "📈",
+                    ),
+                    unsafe_allow_html=True,
+                )
+            
+            with col_add3:
+                # Calculate feature adoption rate
+                total_active = comprehensive_df['total_active_users'][0]
+                first_time_users = comprehensive_df['first_time_users'][0]
+                feature_adoption = min((first_time_users / total_active * 100), 100.0) if total_active > 0 else 0
+                
+                st.markdown(
+                    create_metric_card(
+                        "Feature Adoption Rate",
+                        f"{feature_adoption:.1f}%",
+                        "% of active users who are new to features",
+                        "blue",
+                        "🎯",
+                    ),
+                    unsafe_allow_html=True,
+                )
 
-        # # Core Metrics Row
-        # col1, col2 = st.columns(2)
-        # with col1:
-        #     st.markdown(
-        #         create_metric_card(
-        #             "First Time Users",
-        #             f"{comprehensive_df['first_time_users'][0]:,}",
-        #             "Registered users who used at least one feature",
-        #             'blue',
-        #             '🌟'
-        #         ),
-        #         unsafe_allow_html=True
-        #     )
 
-        # with col2:
-        #     st.markdown(
-        #         create_metric_card(
-        #             "Recurring Users",
-        #             f"{comprehensive_df['recurring_users'][0]:,}",
-        #             "Users with multiple active days",
-        #             'blue',
-        #             '🔄'
-        #         ),
-        #         unsafe_allow_html=True
-        #     )
+        # Row 2: Overall Engagement Metrics
+        st.subheader("📊 Overall Engagement Metrics")
+        col_eng1, col_eng2, col_eng3 = st.columns(3)
+        
+        with col_eng1:
+            st.markdown(
+                create_metric_card(
+                    "Average DAU",
+                    f"{comprehensive_df['avg_dau'][0]:,.0f}",
+                    "Average daily active users across all features",
+                    "green",
+                    "📅",
+                ),
+                unsafe_allow_html=True,
+            )
+        
+        with col_eng2:
+            st.markdown(
+                create_metric_card(
+                    "Average WAU",
+                    f"{comprehensive_df['avg_wau'][0]:,.0f}",
+                    "Average weekly active users across all features",
+                    "green",
+                    "📆",
+                ),
+                unsafe_allow_html=True,
+            )
+        
+        with col_eng3:
+            st.markdown(
+                create_metric_card(
+                    "Average MAU",
+                    f"{comprehensive_df['avg_mau'][0]:,.0f}",
+                    "Average monthly active users across all features",
+                    "green",
+                    "🗓️",
+                ),
+                unsafe_allow_html=True,
+            )
 
-        # Row 2: Feature-Specific Metrics with Color Coding
+        # Row 3: Overall Retention Metrics
+        st.subheader("🔄 Overall Retention Metrics")
+        col_ret1, col_ret2, col_ret3 = st.columns(3)
+        
+        # Fetch overall retention data
+        overall_retention = fetch_retention_metrics(start_date, end_date)
+        
+        if not overall_retention.empty:
+            day1_ret = overall_retention['day1_retention'][0] * 100 if overall_retention['day1_retention'][0] else 0
+            week1_ret = overall_retention['week1_retention'][0] * 100 if overall_retention['week1_retention'][0] else 0
+            month1_ret = overall_retention['month1_retention'][0] * 100 if overall_retention['month1_retention'][0] else 0
+            
+            with col_ret1:
+                st.markdown(
+                    create_metric_card(
+                        "Day 1 Retention",
+                        f"{day1_ret:.1f}%",
+                        "Users returning the next day",
+                        "orange",
+                        "📱",
+                    ),
+                    unsafe_allow_html=True,
+                )
+            
+            with col_ret2:
+                st.markdown(
+                    create_metric_card(
+                        "Week 1 Retention",
+                        f"{week1_ret:.1f}%",
+                        "Users returning within a week",
+                        "orange",
+                        "🗓️",
+                    ),
+                    unsafe_allow_html=True,
+                )
+            
+            with col_ret3:
+                st.markdown(
+                    create_metric_card(
+                        "Month 1 Retention",
+                        f"{month1_ret:.1f}%",
+                        "Users returning within a month",
+                        "orange",
+                        "📊",
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+        # Row 4: Feature-Specific Metrics with Color Coding
         st.subheader("🎪 Feature Engagement")
         col3, col4, col5, col6 = st.columns(4)
 
@@ -1067,11 +1234,11 @@ for tab, feature, feature_name in [
             with col2:
                 st.markdown(
                     create_metric_card(
-                        "First Time Users",
+                        "One Time Usage Users",
                         f"{feature_metrics['first_time_users'][0]:,}",
-                        f"New users to {feature_name.lower()}",
+                        f"Users active on exactly one day in {feature_name.lower()}",
                         feature_color,
-                        "🌟",
+                        "📅",
                     ),
                     unsafe_allow_html=True,
                 )
@@ -1393,7 +1560,6 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
-
 
 
 
