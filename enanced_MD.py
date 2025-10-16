@@ -1,6 +1,7 @@
 import os
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -24,8 +25,10 @@ LADDER_COLORS = {
     "purple": "#6F02CE",
     "light_gray": "#F8F9FA",
     "dark_gray": "#6C757D",
-    "blue": "#3498DB",
+    "blue": "#5C9DD8",
     "light_blue": "#5DADE2",
+    "red": "#991821",
+    "azure": "#0161F3"
 }
 
 # Feature color mapping
@@ -101,6 +104,8 @@ def create_metric_card(
     icon="📊",
     change_value=None,
     change_direction="up",
+    alert_level=None,
+    additional_insight=None,
 ):
     color = LADDER_COLORS[color_key]
 
@@ -110,6 +115,30 @@ def create_metric_card(
         change_color = "#2ECC71" if change_direction == "up" else "#E74C3C"
         change_arrow = "↗️" if change_direction == "up" else "↘️"
         change_html = f'<div style="font-size: 12px; color: {change_color}; margin-top: 5px;">{change_arrow} {change_value}</div>'
+    
+    # Alert level indicator
+    alert_html = ""
+    if alert_level:
+        alert_colors = {
+            "high": "#E74C3C",    # Red for high attention needed
+            "medium": "#F39C12",  # Orange for medium attention
+            "low": "#2ECC71",     # Green for good performance
+            "info": "#3498DB"     # Blue for informational
+        }
+        alert_icons = {
+            "high": "🚨",
+            "medium": "⚠️", 
+            "low": "✅",
+            "info": "ℹ️"
+        }
+        alert_color = alert_colors.get(alert_level, "#3498DB")
+        alert_icon = alert_icons.get(alert_level, "ℹ️")
+        alert_html = f'<div style="font-size: 14px; color: {alert_color}; margin-top: 3px;">{alert_icon}</div>'
+    
+    # Additional insight
+    insight_html = ""
+    if additional_insight:
+        insight_html = f'<div style="font-size: 10px; opacity: 0.9; margin-top: 3px; font-style: italic;">💡 {additional_insight}</div>'
 
     return f"""
     <div style="
@@ -128,6 +157,8 @@ def create_metric_card(
         <div style="font-size: 28px; font-weight: bold; margin-bottom: 5px;">{value}</div>
         <div style="font-size: 11px; opacity: 0.8;">{help_text}</div>
         {change_html}
+        {alert_html}
+        {insight_html}
     </div>
     """
 
@@ -330,13 +361,116 @@ def fetch_comprehensive_metrics(start_date, end_date):
         (SELECT COUNT(DISTINCT user_id) FROM all_feature_usage WHERE feature = 'spending' AND activity_date BETWEEN %s AND %s) AS spending_users,
         (SELECT COUNT(DISTINCT user_id) FROM all_feature_usage WHERE feature = 'savings' AND activity_date BETWEEN %s AND %s) AS savings_users,
         (SELECT COUNT(DISTINCT user_id) FROM all_feature_usage WHERE feature = 'investment' AND activity_date BETWEEN %s AND %s) AS investment_users,
-        (SELECT COUNT(DISTINCT user_id) FROM all_feature_usage WHERE feature = 'lady_ai' AND activity_date BETWEEN %s AND %s) AS lady_ai_users;
+        (SELECT COUNT(DISTINCT user_id) FROM all_feature_usage WHERE feature = 'lady_ai' AND activity_date BETWEEN %s AND %s) AS lady_ai_users,
+        (SELECT COUNT(*) FROM (
+            SELECT user_id, COUNT(DISTINCT feature) as feature_count
+            FROM all_feature_usage 
+            WHERE activity_date BETWEEN %s AND %s
+            GROUP BY user_id
+            HAVING COUNT(DISTINCT feature) = 1
+        ) single_feature) AS single_feature_users,
+        (SELECT COUNT(*) FROM (
+            SELECT user_id, COUNT(DISTINCT feature) as feature_count
+            FROM all_feature_usage 
+            WHERE activity_date BETWEEN %s AND %s
+            GROUP BY user_id
+            HAVING COUNT(DISTINCT feature) > 1
+        ) multi_feature) AS multiple_feature_users,
+        
+        -- Single feature users (users who use only one specific feature)
+        (SELECT COUNT(*) FROM (
+            SELECT user_id
+            FROM all_feature_usage 
+            WHERE activity_date BETWEEN %s AND %s
+            GROUP BY user_id
+            HAVING COUNT(DISTINCT feature) = 1 AND MAX(feature) = 'spending'
+        ) single_spending) AS only_spending_users,
+        (SELECT COUNT(*) FROM (
+            SELECT user_id
+            FROM all_feature_usage 
+            WHERE activity_date BETWEEN %s AND %s
+            GROUP BY user_id
+            HAVING COUNT(DISTINCT feature) = 1 AND MAX(feature) = 'savings'
+        ) single_savings) AS only_savings_users,
+        (SELECT COUNT(*) FROM (
+            SELECT user_id
+            FROM all_feature_usage 
+            WHERE activity_date BETWEEN %s AND %s
+            GROUP BY user_id
+            HAVING COUNT(DISTINCT feature) = 1 AND MAX(feature) = 'investment'
+        ) single_investment) AS only_investment_users,
+        (SELECT COUNT(*) FROM (
+            SELECT user_id
+            FROM all_feature_usage 
+            WHERE activity_date BETWEEN %s AND %s
+            GROUP BY user_id
+            HAVING COUNT(DISTINCT feature) = 1 AND MAX(feature) = 'lady_ai'
+        ) single_lady_ai) AS only_lady_ai_users;
     """
 
     engine = create_engine(db_url)
     with engine.connect() as connection:
-        params = [start_date, end_date] * 10  # Added 2 more for first_time_feature_users
+        params = [start_date, end_date] * 16  # Added 4 more for single feature specific users
         df = pd.read_sql_query(query, connection, params=tuple(params))
+        return df
+
+
+@st.cache_data(ttl=300)
+def fetch_feature_combinations(start_date, end_date):
+    """Fetch feature combinations for multiple feature users"""
+    conn = get_database_connection()
+    if conn is None:
+        return pd.DataFrame()
+
+    query = """
+    WITH all_feature_usage AS (
+        -- Spending
+        SELECT user_id::TEXT, DATE(created_at) AS activity_date, 'spending' AS feature
+        FROM budgets
+        UNION
+        SELECT user_id::TEXT, DATE(created_at), 'spending'
+        FROM manual_and_external_transactions
+        UNION
+        -- Investment
+        SELECT ip.user_id::TEXT, DATE(t.updated_at), 'investment'
+        FROM transactions t
+        JOIN investment_plans ip ON ip.id = t.investment_plan_id
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar'
+        UNION
+        -- Savings
+        SELECT p.user_id::TEXT, DATE(t.updated_at), 'savings'
+        FROM transactions t
+        JOIN plans p ON p.id = t.plan_id
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar'
+        UNION
+        -- Lady AI
+        SELECT "user"::TEXT, DATE(created_at), 'lady_ai'
+        FROM slack_message_dump
+    ),
+    
+    user_features AS (
+        SELECT 
+            user_id,
+            STRING_AGG(DISTINCT feature, ' + ' ORDER BY feature) AS feature_combination,
+            COUNT(DISTINCT feature) AS feature_count
+        FROM all_feature_usage
+        WHERE activity_date BETWEEN %s AND %s
+        GROUP BY user_id
+        HAVING COUNT(DISTINCT feature) > 1
+    )
+    
+    SELECT 
+        feature_combination,
+        COUNT(*) AS user_count,
+        ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) AS percentage
+    FROM user_features
+    GROUP BY feature_combination
+    ORDER BY user_count DESC;
+    """
+
+    engine = create_engine(db_url)
+    with engine.connect() as connection:
+        df = pd.read_sql_query(query, connection, params=(start_date, end_date))
         return df
 
 
@@ -635,6 +769,48 @@ def fetch_trend_data(start_date, end_date, feature=None):
     return dau_df, wau_df, mau_df
 
 
+def analyze_feature_usage_patterns(comprehensive_df):
+    """Analyze feature usage patterns and provide insights"""
+    insights = []
+    
+    if comprehensive_df.empty:
+        return insights
+    
+    # Get feature usage counts
+    spending_users = comprehensive_df['spending_users'][0]
+    savings_users = comprehensive_df['savings_users'][0] 
+    investment_users = comprehensive_df['investment_users'][0]
+    lady_ai_users = comprehensive_df['lady_ai_users'][0]
+    
+    # Find most and least used features
+    feature_usage = {
+        'Spending': spending_users,
+        'Savings': savings_users,
+        'Investment': investment_users,
+        'Lady AI': lady_ai_users
+    }
+    
+    most_used = max(feature_usage, key=feature_usage.get)
+    least_used = min(feature_usage, key=feature_usage.get)
+    
+    # Calculate feature usage percentages
+    total_active = comprehensive_df['total_active_users'][0]
+    if total_active > 0:
+        most_used_pct = (feature_usage[most_used] / total_active) * 100
+        least_used_pct = (feature_usage[least_used] / total_active) * 100
+        
+        insights.append({
+            'most_used_feature': most_used,
+            'most_used_count': feature_usage[most_used],
+            'most_used_pct': most_used_pct,
+            'least_used_feature': least_used,
+            'least_used_count': feature_usage[least_used],
+            'least_used_pct': least_used_pct
+        })
+    
+    return insights
+
+
 def generate_insights(metrics_df, retention_df, feature=None):
     """Generate actionable insights based on the data"""
     insights = []
@@ -770,32 +946,33 @@ if conn:
     absolute_query = """
     WITH feature_usage AS (
         SELECT user_id::TEXT, DATE(created_at) AS activity_date
-        FROM budgets WHERE DATE(created_at) >= '2024-06-24'
+        FROM budgets WHERE DATE(created_at) <= %s
         UNION
         SELECT user_id::TEXT, DATE(created_at)
-        FROM manual_and_external_transactions WHERE DATE(created_at) >= '2024-06-24'
+        FROM manual_and_external_transactions WHERE DATE(created_at) <= %s
         UNION
         SELECT ip.user_id::TEXT, DATE(t.updated_at)
         FROM transactions t
         JOIN investment_plans ip ON ip.id = t.investment_plan_id
-        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) >= '2024-06-24'
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) <= %s
         UNION
         SELECT p.user_id::TEXT, DATE(t.updated_at)
         FROM transactions t
         JOIN plans p ON p.id = t.plan_id
-        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) >= '2024-06-24'
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) <= %s
         UNION
         SELECT "user"::TEXT, DATE(created_at)
-        FROM slack_message_dump WHERE DATE(created_at) >= '2024-06-24'
+        FROM slack_message_dump WHERE DATE(created_at) <= %s
     )
     SELECT 
-        (SELECT COUNT(*) FROM users WHERE DATE(created_at) >= '2024-06-24' AND restricted = false) AS absolute_total_signups,
+        (SELECT COUNT(*) FROM users WHERE DATE(created_at) <= %s AND restricted = false) AS absolute_total_signups,
         (SELECT COUNT(DISTINCT user_id) FROM feature_usage) AS absolute_total_active_users;
     """
 
     engine = create_engine(db_url)
     with engine.connect() as connection:
-        abs_df = pd.read_sql_query(absolute_query, connection)
+        # Pass end_date parameter 6 times (once for each %s in the query)
+        abs_df = pd.read_sql_query(absolute_query, connection, params=(end_date, end_date, end_date, end_date, end_date, end_date))
         if not abs_df.empty:
             absolute_metrics = abs_df.iloc[0].to_dict()
 
@@ -828,8 +1005,8 @@ with tab1:
                 create_metric_card(
                     "Absolute Total Signups",
                     f"{absolute_metrics['absolute_total_signups']:,}",
-                    "Total signups since June 24, 2024",
-                    "blue",
+                    f"Total signups from inception to {end_date}",
+                    "navy",
                     "🚀",
                 ),
                 unsafe_allow_html=True,
@@ -839,8 +1016,8 @@ with tab1:
                 create_metric_card(
                     "Absolute Active Users",
                     f"{absolute_metrics['absolute_total_active_users']:,}",
-                    "Total active users since June 24, 2024",
-                    "blue",
+                    f"Total active users from inception to {end_date}",
+                    "navy",
                     "⚡",
                 ),
                 unsafe_allow_html=True,
@@ -858,7 +1035,7 @@ with tab1:
                         "Total Signups",
                         f"{comprehensive_df['total_signups'][0]:,}",
                         f"New signups from {start_date} to {end_date}",
-                        "navy",
+                        "azure",
                         "👥",
                     ),
                     unsafe_allow_html=True,
@@ -870,7 +1047,7 @@ with tab1:
                         "Total Active Users",
                         f"{comprehensive_df['total_active_users'][0]:,}",
                         f"Users active from {start_date} to {end_date}",
-                        "navy",
+                        "azure",
                         "🎯",
                     ),
                     unsafe_allow_html=True,
@@ -882,7 +1059,7 @@ with tab1:
                         "First Time Users",
                         f"{comprehensive_df['first_time_users'][0]:,}",
                         "Users who used features for the first time in this period",
-                        "navy",
+                        "azure",
                         "🌟",
                     ),
                     unsafe_allow_html=True,
@@ -893,7 +1070,7 @@ with tab1:
                         "One Time Usage Users",
                         f"{comprehensive_df['one_time_usage_users'][0]:,}",
                         "Users active on exactly one day",
-                        "navy",
+                        "azure",
                         "📅",
                     ),
                     unsafe_allow_html=True,
@@ -909,45 +1086,57 @@ with tab1:
                         "Recurring Users",
                         f"{comprehensive_df['recurring_users'][0]:,}",
                         "Users with multiple active days",
-                        "navy",
+                        "azure",
                         "🔄",
                     ),
                     unsafe_allow_html=True,
                 )
             
             with col_add2:
-                # Calculate Signup Conversion Rate
+                # Calculate Signup Conversion Rate with insights
                 total_signups = comprehensive_df['total_signups'][0]
                 first_time_users = comprehensive_df['first_time_users'][0]
                 conversion_rate = (first_time_users / total_signups * 100) if total_signups > 0 else 0
                 
-                st.markdown(
-                    create_metric_card(
-                        "Signup Conversion Rate",
-                        f"{conversion_rate:.1f}%",
-                        "% of registered users who used a feature",
-                        "green",
-                        "📈",
-                    ),
-                    unsafe_allow_html=True,
+                # Determine alert level and insight
+                conversion_alert = "high" if conversion_rate < 20 else "medium" if conversion_rate < 40 else "low"
+                conversion_insight = "Critical: Improve onboarding flow" if conversion_rate < 20 else "Good: Focus on activation campaigns" if conversion_rate < 40 else "Excellent: Maintain current strategy"
+                
+                # Create the metric card HTML
+                metric_html = create_metric_card(
+                    "Signup Conversion Rate",
+                    f"{conversion_rate:.1f}%",
+                    f"{first_time_users:,} of {total_signups:,} signups activated",
+                    "green" if conversion_rate > 40 else "orange" if conversion_rate > 20 else "red",
+                    "📈",
+                    alert_level=conversion_alert,
+                    additional_insight=conversion_insight
                 )
+                # Use components.html for better HTML rendering
+                components.html(metric_html, height=200)
             
             with col_add3:
-                # Calculate feature adoption rate
+                # Calculate feature adoption rate with insights
                 total_active = comprehensive_df['total_active_users'][0]
                 first_time_users = comprehensive_df['first_time_users'][0]
                 feature_adoption = min((first_time_users / total_active * 100), 100.0) if total_active > 0 else 0
                 
-                st.markdown(
-                    create_metric_card(
-                        "Feature Adoption Rate",
-                        f"{feature_adoption:.1f}%",
-                        "% of active users who are new to features",
-                        "blue",
-                        "🎯",
-                    ),
-                    unsafe_allow_html=True,
+                # Determine alert level and insight
+                adoption_alert = "high" if feature_adoption > 80 else "medium" if feature_adoption > 50 else "low"
+                adoption_insight = "High new user acquisition" if feature_adoption > 80 else "Balanced user growth" if feature_adoption > 50 else "Focus on user retention"
+                
+                # Create the metric card HTML
+                adoption_html = create_metric_card(
+                    "Feature Adoption Rate",
+                    f"{feature_adoption:.1f}%",
+                    f"{first_time_users:,} new feature users",
+                    "green" if feature_adoption > 70 else "orange" if feature_adoption > 40 else "red",
+                    "🎯",
+                    alert_level=adoption_alert,
+                    additional_insight=adoption_insight
                 )
+                # Use components.html for better HTML rendering
+                components.html(adoption_html, height=200)
 
 
         # Row 2: Overall Engagement Metrics
@@ -960,7 +1149,7 @@ with tab1:
                     "Average DAU",
                     f"{comprehensive_df['avg_dau'][0]:,.0f}",
                     "Average daily active users across all features",
-                    "green",
+                    "azure",
                     "📅",
                 ),
                 unsafe_allow_html=True,
@@ -972,7 +1161,7 @@ with tab1:
                     "Average WAU",
                     f"{comprehensive_df['avg_wau'][0]:,.0f}",
                     "Average weekly active users across all features",
-                    "green",
+                    "azure",
                     "📆",
                 ),
                 unsafe_allow_html=True,
@@ -984,7 +1173,7 @@ with tab1:
                     "Average MAU",
                     f"{comprehensive_df['avg_mau'][0]:,.0f}",
                     "Average monthly active users across all features",
-                    "green",
+                    "azure",
                     "🗓️",
                 ),
                 unsafe_allow_html=True,
@@ -1008,7 +1197,7 @@ with tab1:
                         "Day 1 Retention",
                         f"{day1_ret:.1f}%",
                         "Users returning the next day",
-                        "orange",
+                        "azure",
                         "📱",
                     ),
                     unsafe_allow_html=True,
@@ -1020,7 +1209,7 @@ with tab1:
                         "Week 1 Retention",
                         f"{week1_ret:.1f}%",
                         "Users returning within a week",
-                        "orange",
+                        "azure",
                         "🗓️",
                     ),
                     unsafe_allow_html=True,
@@ -1032,64 +1221,337 @@ with tab1:
                         "Month 1 Retention",
                         f"{month1_ret:.1f}%",
                         "Users returning within a month",
-                        "orange",
+                        "azure",
                         "📊",
                     ),
                     unsafe_allow_html=True,
                 )
 
-        # Row 4: Feature-Specific Metrics with Color Coding
-        st.subheader("🎪 Feature Engagement")
+        # Row 4: Enhanced Feature-Specific Metrics with Insights
+        st.subheader("🎪 Feature Engagement with Insights")
         col3, col4, col5, col6 = st.columns(4)
 
+        # Calculate feature usage percentages for insights
+        total_active = comprehensive_df['total_active_users'][0]
+        spending_pct = (comprehensive_df['spending_users'][0] / total_active * 100) if total_active > 0 else 0
+        lady_ai_pct = (comprehensive_df['lady_ai_users'][0] / total_active * 100) if total_active > 0 else 0
+        savings_pct = (comprehensive_df['savings_users'][0] / total_active * 100) if total_active > 0 else 0
+        investment_pct = (comprehensive_df['investment_users'][0] / total_active * 100) if total_active > 0 else 0
+
         with col3:
-            st.markdown(
-                create_metric_card(
-                    "Spending Users",
-                    f"{comprehensive_df['spending_users'][0]:,}",
-                    "Users active in spending features",
-                    "blue",  # Blue for spending
-                    "💰",
-                ),
-                unsafe_allow_html=True,
+            # Determine alert level and insight for spending
+            spending_alert = "low" if spending_pct > 40 else "medium" if spending_pct < 20 else "info"
+            spending_insight = "Strong spending engagement" if spending_pct > 40 else "Consider spending feature promotion" if spending_pct < 20 else "Normal spending usage"
+            
+            spending_html = create_metric_card(
+                "Spending Users",
+                f"{comprehensive_df['spending_users'][0]:,}",
+                f"{spending_pct:.1f}% of active users",
+                "blue",  # Blue for spending
+                "💰",
+                alert_level=spending_alert,
+                additional_insight=spending_insight
             )
+            components.html(spending_html, height=200)
 
         with col4:
-            st.markdown(
-                create_metric_card(
-                    "Lady AI Users",
-                    f"{comprehensive_df['lady_ai_users'][0]:,}",
-                    "Users engaging with Lady AI",
-                    "orange",  # Orange for Lady AI
-                    "🤖",
-                ),
-                unsafe_allow_html=True,
+            # Determine alert level and insight for Lady AI
+            lady_ai_alert = "low" if lady_ai_pct > 30 else "medium" if lady_ai_pct < 10 else "info"
+            lady_ai_insight = "High AI engagement" if lady_ai_pct > 30 else "Boost Lady AI adoption" if lady_ai_pct < 10 else "Steady AI usage"
+            
+            lady_ai_html = create_metric_card(
+                "Lady AI Users",
+                f"{comprehensive_df['lady_ai_users'][0]:,}",
+                f"{lady_ai_pct:.1f}% of active users",
+                "orange",  # Orange for Lady AI
+                "🤖",
+                alert_level=lady_ai_alert,
+                additional_insight=lady_ai_insight
             )
+            components.html(lady_ai_html, height=200)
 
         with col5:
-            st.markdown(
-                create_metric_card(
-                    "Savings Users",
-                    f"{comprehensive_df['savings_users'][0]:,}",
-                    "Users active in savings",
-                    "green",
-                    "🏦",
-                ),
-                unsafe_allow_html=True,
+            # Determine alert level and insight for savings
+            savings_alert = "low" if savings_pct > 25 else "medium" if savings_pct < 15 else "info"
+            savings_insight = "Strong savings culture" if savings_pct > 25 else "Promote savings features" if savings_pct < 15 else "Healthy savings usage"
+            
+            savings_html = create_metric_card(
+                "Savings Users",
+                f"{comprehensive_df['savings_users'][0]:,}",
+                f"{savings_pct:.1f}% of active users",
+                "green",
+                "🏦",
+                alert_level=savings_alert,
+                additional_insight=savings_insight
             )
+            components.html(savings_html, height=200)
 
         with col6:
-            st.markdown(
-                create_metric_card(
-                    "Investment Users",
-                    f"{comprehensive_df['investment_users'][0]:,}",
-                    "Users active in investments",
-                    "purple",
-                    "📈",
-                ),
-                unsafe_allow_html=True,
+            # Determine alert level and insight for investment
+            investment_alert = "low" if investment_pct > 20 else "medium" if investment_pct < 8 else "info"
+            investment_insight = "High investment engagement" if investment_pct > 20 else "Focus on investment adoption" if investment_pct < 8 else "Growing investment usage"
+            
+            investment_html = create_metric_card(
+                "Investment Users",
+                f"{comprehensive_df['investment_users'][0]:,}",
+                f"{investment_pct:.1f}% of active users",
+                "purple",
+                "📈",
+                alert_level=investment_alert,
+                additional_insight=investment_insight
             )
+            components.html(investment_html, height=200)
+        # Row 5: Enhanced Feature Usage Patterns & Analytics
+        st.subheader("🎯 Feature Usage Patterns & Analytics")
+        
+        # Get feature usage analysis
+        feature_analysis = analyze_feature_usage_patterns(comprehensive_df)
+        
+        # Single vs Multiple Feature Users
+        col_pattern1, col_pattern2 = st.columns(2)
 
+        with col_pattern1:
+            # Calculate single feature users with insights
+            single_feature_users = comprehensive_df['single_feature_users'][0] if 'single_feature_users' in comprehensive_df.columns else 0
+            total_active_for_patterns = comprehensive_df['total_active_users'][0]
+            single_feature_pct = (single_feature_users / total_active_for_patterns * 100) if total_active_for_patterns > 0 else 0
+            
+            # Determine alert level for single feature users
+            alert_level = "medium" if single_feature_pct > 60 else "low" if single_feature_pct < 40 else "info"
+            additional_insight = f"Opportunity to cross-sell other features" if single_feature_pct > 50 else "Good feature adoption balance"
+            
+            single_html = create_metric_card(
+                "Single Feature Users",
+                f"{single_feature_users:,}",
+                f"{single_feature_pct:.1f}% of active users use only one feature",
+                "azure",
+                "🎯",
+                alert_level=alert_level,
+                additional_insight=additional_insight
+            )
+            components.html(single_html, height=200)
+
+        with col_pattern2:
+            # Calculate multiple feature users with insights
+            multiple_feature_users = comprehensive_df['multiple_feature_users'][0] if 'multiple_feature_users' in comprehensive_df.columns else 0
+            multiple_feature_pct = (multiple_feature_users / total_active_for_patterns * 100) if total_active_for_patterns > 0 else 0
+            
+            # Determine alert level for multiple feature users
+            alert_level = "low" if multiple_feature_pct > 40 else "medium" if multiple_feature_pct < 20 else "info"
+            additional_insight = f"High engagement users - focus on retention" if multiple_feature_pct > 40 else "Potential to increase feature adoption"
+            
+            multiple_html = create_metric_card(
+                "Multiple Feature Users",
+                f"{multiple_feature_users:,}",
+                f"{multiple_feature_pct:.1f}% of active users use multiple features",
+                "azure",
+                "🔄",
+                alert_level=alert_level,
+                additional_insight=additional_insight
+            )
+            components.html(multiple_html, height=200)
+        
+        # Row 6: Most/Least Used Features
+        st.subheader("📊 Feature Usage Rankings")
+        col_rank1, col_rank2 = st.columns(2)
+        
+        if feature_analysis:
+            analysis = feature_analysis[0]
+            
+            with col_rank1:
+                # Most used feature
+                most_used = analysis['most_used_feature']
+                most_used_count = analysis['most_used_count']
+                most_used_pct = analysis['most_used_pct']
+                
+                # Determine alert level
+                alert_level = "low" if most_used_pct > 60 else "info"
+                additional_insight = f"Leading feature - leverage for marketing campaigns"
+                
+                most_used_html = create_metric_card(
+                    f"Most Used Feature: {most_used}",
+                    f"{most_used_count:,}",
+                    f"{most_used_pct:.1f}% of active users",
+                    "green",
+                    "🏆",
+                    alert_level=alert_level,
+                    additional_insight=additional_insight
+                )
+                components.html(most_used_html, height=200)
+            
+            with col_rank2:
+                # Least used feature
+                least_used = analysis['least_used_feature']
+                least_used_count = analysis['least_used_count']
+                least_used_pct = analysis['least_used_pct']
+                
+                # Determine alert level
+                alert_level = "high" if least_used_pct < 15 else "medium" if least_used_pct < 25 else "info"
+                additional_insight = f"Focus on improving {least_used.lower()} adoption" if least_used_pct < 20 else "Consider feature enhancement"
+                
+                least_used_html = create_metric_card(
+                    f"Least Used Feature: {least_used}",
+                    f"{least_used_count:,}",
+                    f"{least_used_pct:.1f}% of active users",
+                    "red",
+                    "📉",
+                    alert_level=alert_level,
+                    additional_insight=additional_insight
+                )
+                components.html(least_used_html, height=200)
+        
+        # Row 7: Single Feature Specific Users
+        st.subheader("🎯 Single Feature Specific Users")
+        col_single1, col_single2, col_single3, col_single4 = st.columns(4)
+        
+        # Only Spending Users
+        with col_single1:
+            only_spending = comprehensive_df['only_spending_users'][0] if 'only_spending_users' in comprehensive_df.columns else 0
+            spending_pct = (only_spending / total_active_for_patterns * 100) if total_active_for_patterns > 0 else 0
+            
+            alert_level = "info" if spending_pct > 10 else "medium"
+            additional_insight = "Cross-sell savings/investment features" if spending_pct > 15 else "Normal spending-only user segment"
+            
+            only_spending_html = create_metric_card(
+                "Only Spending Users",
+                f"{only_spending:,}",
+                f"{spending_pct:.1f}% of active users",
+                "blue",
+                "💰",
+                alert_level=alert_level,
+                additional_insight=additional_insight
+            )
+            components.html(only_spending_html, height=200)
+        
+        # Only Lady AI Users
+        with col_single2:
+            only_lady_ai = comprehensive_df['only_lady_ai_users'][0] if 'only_lady_ai_users' in comprehensive_df.columns else 0
+            lady_ai_pct = (only_lady_ai / total_active_for_patterns * 100) if total_active_for_patterns > 0 else 0
+            
+            alert_level = "info" if lady_ai_pct > 5 else "medium"
+            additional_insight = "Engage with financial planning features" if lady_ai_pct > 10 else "AI-only users segment"
+            
+            only_lady_ai_html = create_metric_card(
+                "Only Lady AI Users",
+                f"{only_lady_ai:,}",
+                f"{lady_ai_pct:.1f}% of active users",
+                "orange",
+                "🤖",
+                alert_level=alert_level,
+                additional_insight=additional_insight
+            )
+            components.html(only_lady_ai_html, height=200)
+        
+        # Only Savings Users
+        with col_single3:
+            only_savings = comprehensive_df['only_savings_users'][0] if 'only_savings_users' in comprehensive_df.columns else 0
+            savings_pct = (only_savings / total_active_for_patterns * 100) if total_active_for_patterns > 0 else 0
+            
+            alert_level = "info" if savings_pct > 8 else "medium"
+            additional_insight = "Introduce spending tracking" if savings_pct > 12 else "Savings-focused user segment"
+            
+            only_savings_html = create_metric_card(
+                "Only Savings Users",
+                f"{only_savings:,}",
+                f"{savings_pct:.1f}% of active users",
+                "green",
+                "🏦",
+                alert_level=alert_level,
+                additional_insight=additional_insight
+            )
+            components.html(only_savings_html, height=200)
+        
+        # Only Investment Users
+        with col_single4:
+            only_investment = comprehensive_df['only_investment_users'][0] if 'only_investment_users' in comprehensive_df.columns else 0
+            investment_pct = (only_investment / total_active_for_patterns * 100) if total_active_for_patterns > 0 else 0
+            
+            alert_level = "info" if investment_pct > 3 else "medium"
+            additional_insight = "High-value users - premium features" if investment_pct > 5 else "Investment-focused segment"
+            
+            only_investment_html = create_metric_card(
+                "Only Investment Users",
+                f"{only_investment:,}",
+                f"{investment_pct:.1f}% of active users",
+                "purple",
+                "📈",
+                alert_level=alert_level,
+                additional_insight=additional_insight
+            )
+            components.html(only_investment_html, height=200)
+        
+        # Row 8: Feature Combinations Analysis
+        st.subheader("🔄 Multiple Feature Combinations")
+        
+        # Fetch feature combinations data
+        feature_combinations_df = fetch_feature_combinations(start_date, end_date)
+        
+        if not feature_combinations_df.empty:
+            # Most popular combination metric card
+            most_popular_combo = feature_combinations_df.iloc[0]
+            combo_name = most_popular_combo['feature_combination']
+            combo_count = most_popular_combo['user_count']
+            combo_pct = most_popular_combo['percentage']
+            
+            col_combo1, col_combo2 = st.columns(2)
+            
+            with col_combo1:
+                most_popular_html = create_metric_card(
+                    f"Most Popular Combination",
+                    f"{combo_count:,}",
+                    f"{combo_name} ({combo_pct:.1f}% of multi-feature users)",
+                    "purple",
+                    "🔥",
+                    alert_level="low",
+                    additional_insight="Focus marketing on this combination"
+                )
+                components.html(most_popular_html, height=200)
+            
+            with col_combo2:
+                # Show total combinations count
+                total_combinations = len(feature_combinations_df)
+                total_combinations_html = create_metric_card(
+                    "Total Combinations",
+                    f"{total_combinations}",
+                    "Different feature combinations used",
+                    "blue",
+                    "🎭",
+                    alert_level="info",
+                    additional_insight="Shows user behavior diversity"
+                )
+                components.html(total_combinations_html, height=200)
+            
+            # Expandable table for feature combinations
+            with st.expander("📋 View All Feature Combinations", expanded=False):
+                st.markdown("**Feature Combination Breakdown for Multiple Feature Users**")
+                
+                # Style the dataframe
+                styled_df = feature_combinations_df.copy()
+                styled_df['feature_combination'] = styled_df['feature_combination'].str.replace(' + ', ' + ', regex=False)
+                styled_df = styled_df.rename(columns={
+                    'feature_combination': 'Feature Combination',
+                    'user_count': 'Users',
+                    'percentage': '% of Multi-Feature Users'
+                })
+                
+                # Add color coding based on usage
+                def highlight_rows(row):
+                    if row.name == 0:  # Most popular
+                        return ['background-color: #E8F5E8'] * len(row)
+                    elif row['% of Multi-Feature Users'] > 15:  # High usage
+                        return ['background-color: #F0F8FF'] * len(row)
+                    else:
+                        return [''] * len(row)
+                
+                styled_df = styled_df.style.apply(highlight_rows, axis=1)
+                st.dataframe(styled_df, use_container_width=True)
+                
+                # Add insights about combinations
+                if len(feature_combinations_df) > 1:
+                    second_popular = feature_combinations_df.iloc[1]
+                    st.info(f"💡 **Insight**: The top 2 combinations ({combo_name} and {second_popular['feature_combination']}) represent {combo_pct + second_popular['percentage']:.1f}% of all multi-feature users.")
+        else:
+            st.info("No multiple feature combinations found for the selected period.")
     # Generate and display insights
     retention_df = fetch_retention_metrics(start_date, end_date)
     insights = generate_insights(comprehensive_df, retention_df)
@@ -1560,6 +2022,5 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
-
 
 
