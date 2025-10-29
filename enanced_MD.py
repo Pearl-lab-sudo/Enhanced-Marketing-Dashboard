@@ -769,6 +769,410 @@ def fetch_trend_data(start_date, end_date, feature=None):
     return dau_df, wau_df, mau_df
 
 
+# -------------------------------
+# Overview Trend and Churn Helpers
+# -------------------------------
+@st.cache_data(ttl=300)
+def fetch_overview_trend(start_date, end_date):
+    """Daily trend for signups, active users, Lady AI users, and spending users within the selected period."""
+    conn = get_database_connection()
+    if conn is None:
+        return pd.DataFrame()
+
+    query = """
+    WITH days AS (
+        SELECT generate_series(%s::date, %s::date, interval '1 day')::date AS dt
+    ),
+    signups AS (
+        SELECT DATE(created_at) AS dt, COUNT(*) AS signups
+        FROM users
+        WHERE restricted = false AND DATE(created_at) BETWEEN %s AND %s
+        GROUP BY 1
+    ),
+    all_feature_usage AS (
+        -- Spending
+        SELECT user_id::TEXT AS user_id, DATE(created_at) AS activity_date, 'spending' AS feature
+        FROM budgets WHERE DATE(created_at) BETWEEN %s AND %s
+        UNION ALL
+        SELECT user_id::TEXT, DATE(created_at), 'spending'
+        FROM manual_and_external_transactions WHERE DATE(created_at) BETWEEN %s AND %s
+        UNION ALL
+        -- Investment
+        SELECT ip.user_id::TEXT, DATE(t.updated_at), 'investment'
+        FROM transactions t
+        JOIN investment_plans ip ON ip.id = t.investment_plan_id
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) BETWEEN %s AND %s
+        UNION ALL
+        -- Savings
+        SELECT p.user_id::TEXT, DATE(t.updated_at), 'savings'
+        FROM transactions t
+        JOIN plans p ON p.id = t.plan_id
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar' AND DATE(t.updated_at) BETWEEN %s AND %s
+        UNION ALL
+        -- Lady AI
+        SELECT "user"::TEXT, DATE(created_at), 'lady_ai'
+        FROM slack_message_dump WHERE DATE(created_at) BETWEEN %s AND %s
+    ),
+    active AS (
+        SELECT activity_date AS dt, COUNT(DISTINCT user_id) AS active_users
+        FROM all_feature_usage
+        GROUP BY 1
+    ),
+    lady AS (
+        SELECT activity_date AS dt, COUNT(DISTINCT user_id) AS lady_users
+        FROM all_feature_usage
+        WHERE feature = 'lady_ai'
+        GROUP BY 1
+    ),
+    spending AS (
+        SELECT activity_date AS dt, COUNT(DISTINCT user_id) AS spending_users
+        FROM all_feature_usage
+        WHERE feature = 'spending'
+        GROUP BY 1
+    ),
+    savings AS (
+        SELECT activity_date AS dt, COUNT(DISTINCT user_id) AS savings_users
+        FROM all_feature_usage
+        WHERE feature = 'savings'
+        GROUP BY 1
+    ),
+    investment AS (
+        SELECT activity_date AS dt, COUNT(DISTINCT user_id) AS investment_users
+        FROM all_feature_usage
+        WHERE feature = 'investment'
+        GROUP BY 1
+    )
+    SELECT 
+        d.dt AS activity_date,
+        COALESCE(s.signups, 0) AS signups,
+        COALESCE(a.active_users, 0) AS active_users,
+        COALESCE(l.lady_users, 0) AS lady_users,
+        COALESCE(sp.spending_users, 0) AS spending_users,
+        COALESCE(sv.savings_users, 0) AS savings_users,
+        COALESCE(iv.investment_users, 0) AS investment_users
+    FROM days d
+    LEFT JOIN signups s ON s.dt = d.dt
+    LEFT JOIN active a ON a.dt = d.dt
+    LEFT JOIN lady l ON l.dt = d.dt
+    LEFT JOIN spending sp ON sp.dt = d.dt
+    LEFT JOIN savings sv ON sv.dt = d.dt
+    LEFT JOIN investment iv ON iv.dt = d.dt
+    ORDER BY d.dt;
+    """
+
+    params = (
+        start_date, end_date,
+        start_date, end_date,
+        start_date, end_date,
+        start_date, end_date,
+        start_date, end_date,
+        start_date, end_date,
+        start_date, end_date
+    )
+
+    engine = create_engine(db_url)
+    with engine.connect() as connection:
+        df = pd.read_sql_query(query, connection, params=params)
+    return df
+
+
+@st.cache_data(ttl=300)
+def fetch_churn_count(start_date, end_date):
+    """Number of customers who used any feature before end_date but did not use any feature in [start_date, end_date]."""
+    conn = get_database_connection()
+    if conn is None:
+        return 0
+
+    query = """
+    WITH all_feature_usage AS (
+        -- Spending
+        SELECT user_id::TEXT AS user_id, DATE(created_at) AS activity_date
+        FROM budgets
+        UNION
+        SELECT user_id::TEXT, DATE(created_at)
+        FROM manual_and_external_transactions
+        UNION
+        -- Investment
+        SELECT ip.user_id::TEXT, DATE(t.updated_at)
+        FROM transactions t
+        JOIN investment_plans ip ON ip.id = t.investment_plan_id
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar'
+        UNION
+        -- Savings
+        SELECT p.user_id::TEXT, DATE(t.updated_at)
+        FROM transactions t
+        JOIN plans p ON p.id = t.plan_id
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar'
+        UNION
+        -- Lady AI
+        SELECT "user"::TEXT, DATE(created_at)
+        FROM slack_message_dump
+    ), users_ever AS (
+        SELECT DISTINCT user_id
+        FROM all_feature_usage
+        WHERE activity_date <= %s
+    ), users_in_period AS (
+        SELECT DISTINCT user_id
+        FROM all_feature_usage
+        WHERE activity_date BETWEEN %s AND %s
+    )
+    SELECT COUNT(*) AS churn_count
+    FROM users_ever e
+    LEFT JOIN users_in_period p ON e.user_id = p.user_id
+    WHERE p.user_id IS NULL;
+    """
+
+    engine = create_engine(db_url)
+    with engine.connect() as connection:
+        df = pd.read_sql_query(query, connection, params=(end_date, start_date, end_date))
+        return int(df.iloc[0]["churn_count"]) if not df.empty else 0
+
+
+# -------------------------------
+# Customer Feature Analysis Functions
+# -------------------------------
+@st.cache_data(ttl=300)
+def fetch_dormant_users_analysis(start_date, end_date, dormant_period_days):
+    """Fetch analysis of dormant users - users who used features before but not in the specified period"""
+    conn = get_database_connection()
+    if conn is None:
+        return pd.DataFrame()
+
+    # Calculate the historical period (before the current analysis period)
+    analysis_start = pd.to_datetime(start_date)
+    historical_start = analysis_start - timedelta(days=dormant_period_days)
+    
+    query = """
+    WITH users_filtered AS (
+        SELECT id::TEXT AS user_id, DATE(created_at) AS signup_date
+        FROM users
+        WHERE restricted = false
+    ),
+
+    all_feature_usage AS (
+        -- Spending
+        SELECT user_id::TEXT, DATE(created_at) AS activity_date, 'spending' AS feature
+        FROM budgets
+        UNION
+        SELECT user_id::TEXT, DATE(created_at), 'spending'
+        FROM manual_and_external_transactions
+        UNION
+        -- Investment
+        SELECT ip.user_id::TEXT, DATE(t.updated_at), 'investment'
+        FROM transactions t
+        JOIN investment_plans ip ON ip.id = t.investment_plan_id
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar'
+        UNION
+        -- Savings
+        SELECT p.user_id::TEXT, DATE(t.updated_at), 'savings'
+        FROM transactions t
+        JOIN plans p ON p.id = t.plan_id
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar'
+        UNION
+        -- Lady AI
+        SELECT "user"::TEXT, DATE(created_at), 'lady_ai'
+        FROM slack_message_dump
+    ),
+
+    -- Users who had activity in historical period
+    historical_users AS (
+        SELECT DISTINCT user_id
+        FROM all_feature_usage
+        WHERE activity_date BETWEEN %s AND %s
+    ),
+
+    -- Users who had activity in current analysis period
+    current_users AS (
+        SELECT DISTINCT user_id
+        FROM all_feature_usage
+        WHERE activity_date BETWEEN %s AND %s
+    ),
+
+    -- Overall dormant users (used features historically but not in current period)
+    overall_dormant AS (
+        SELECT h.user_id
+        FROM historical_users h
+        LEFT JOIN current_users c ON h.user_id = c.user_id
+        WHERE c.user_id IS NULL
+    ),
+
+    -- Feature-specific dormant users
+    spending_historical AS (
+        SELECT DISTINCT user_id
+        FROM all_feature_usage
+        WHERE feature = 'spending' AND activity_date BETWEEN %s AND %s
+    ),
+    spending_current AS (
+        SELECT DISTINCT user_id
+        FROM all_feature_usage
+        WHERE feature = 'spending' AND activity_date BETWEEN %s AND %s
+    ),
+    spending_dormant AS (
+        SELECT h.user_id
+        FROM spending_historical h
+        LEFT JOIN spending_current c ON h.user_id = c.user_id
+        WHERE c.user_id IS NULL
+    ),
+
+    savings_historical AS (
+        SELECT DISTINCT user_id
+        FROM all_feature_usage
+        WHERE feature = 'savings' AND activity_date BETWEEN %s AND %s
+    ),
+    savings_current AS (
+        SELECT DISTINCT user_id
+        FROM all_feature_usage
+        WHERE feature = 'savings' AND activity_date BETWEEN %s AND %s
+    ),
+    savings_dormant AS (
+        SELECT h.user_id
+        FROM savings_historical h
+        LEFT JOIN savings_current c ON h.user_id = c.user_id
+        WHERE c.user_id IS NULL
+    ),
+
+    investment_historical AS (
+        SELECT DISTINCT user_id
+        FROM all_feature_usage
+        WHERE feature = 'investment' AND activity_date BETWEEN %s AND %s
+    ),
+    investment_current AS (
+        SELECT DISTINCT user_id
+        FROM all_feature_usage
+        WHERE feature = 'investment' AND activity_date BETWEEN %s AND %s
+    ),
+    investment_dormant AS (
+        SELECT h.user_id
+        FROM investment_historical h
+        LEFT JOIN investment_current c ON h.user_id = c.user_id
+        WHERE c.user_id IS NULL
+    ),
+
+    lady_ai_historical AS (
+        SELECT DISTINCT user_id
+        FROM all_feature_usage
+        WHERE feature = 'lady_ai' AND activity_date BETWEEN %s AND %s
+    ),
+    lady_ai_current AS (
+        SELECT DISTINCT user_id
+        FROM all_feature_usage
+        WHERE feature = 'lady_ai' AND activity_date BETWEEN %s AND %s
+    ),
+    lady_ai_dormant AS (
+        SELECT h.user_id
+        FROM lady_ai_historical h
+        LEFT JOIN lady_ai_current c ON h.user_id = c.user_id
+        WHERE c.user_id IS NULL
+    )
+
+    SELECT
+        (SELECT COUNT(*) FROM overall_dormant) AS overall_dormant_users,
+        (SELECT COUNT(*) FROM spending_dormant) AS spending_dormant_users,
+        (SELECT COUNT(*) FROM savings_dormant) AS savings_dormant_users,
+        (SELECT COUNT(*) FROM investment_dormant) AS investment_dormant_users,
+        (SELECT COUNT(*) FROM lady_ai_dormant) AS lady_ai_dormant_users,
+        (SELECT COUNT(*) FROM historical_users) AS total_historical_users,
+        (SELECT COUNT(*) FROM current_users) AS total_current_users;
+    """
+
+    engine = create_engine(db_url)
+    with engine.connect() as connection:
+        params = [
+            historical_start.date(), analysis_start.date(),  # Historical period
+            start_date, end_date,  # Current analysis period
+            historical_start.date(), analysis_start.date(),  # Spending historical
+            start_date, end_date,  # Spending current
+            historical_start.date(), analysis_start.date(),  # Savings historical
+            start_date, end_date,  # Savings current
+            historical_start.date(), analysis_start.date(),  # Investment historical
+            start_date, end_date,  # Investment current
+            historical_start.date(), analysis_start.date(),  # Lady AI historical
+            start_date, end_date,  # Lady AI current
+        ]
+        df = pd.read_sql_query(query, connection, params=tuple(params))
+        return df
+
+
+@st.cache_data(ttl=300)
+def fetch_dormant_users_trend(start_date, end_date, dormant_period_days):
+    """Fetch trend data for dormant users over time"""
+    conn = get_database_connection()
+    if conn is None:
+        return pd.DataFrame()
+
+    # Calculate the historical period
+    analysis_start = pd.to_datetime(start_date)
+    historical_start = analysis_start - timedelta(days=dormant_period_days)
+    
+    query = """
+    WITH all_feature_usage AS (
+        -- Spending
+        SELECT user_id::TEXT, DATE(created_at) AS activity_date, 'spending' AS feature
+        FROM budgets
+        UNION
+        SELECT user_id::TEXT, DATE(created_at), 'spending'
+        FROM manual_and_external_transactions
+        UNION
+        -- Investment
+        SELECT ip.user_id::TEXT, DATE(t.updated_at), 'investment'
+        FROM transactions t
+        JOIN investment_plans ip ON ip.id = t.investment_plan_id
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar'
+        UNION
+        -- Savings
+        SELECT p.user_id::TEXT, DATE(t.updated_at), 'savings'
+        FROM transactions t
+        JOIN plans p ON p.id = t.plan_id
+        WHERE t.status = 'success' AND t.provider_number != 'Flex Dollar'
+        UNION
+        -- Lady AI
+        SELECT "user"::TEXT, DATE(created_at), 'lady_ai'
+        FROM slack_message_dump
+    ),
+
+    -- Get all unique dates in the analysis period
+    analysis_dates AS (
+        SELECT DISTINCT activity_date
+        FROM all_feature_usage
+        WHERE activity_date BETWEEN %s AND %s
+        ORDER BY activity_date
+    ),
+
+    -- For each date, calculate dormant users
+    daily_dormant AS (
+        SELECT 
+            ad.activity_date,
+            COUNT(DISTINCT h.user_id) AS dormant_count
+        FROM analysis_dates ad
+        CROSS JOIN (
+            SELECT DISTINCT user_id
+            FROM all_feature_usage
+            WHERE activity_date BETWEEN %s AND %s
+        ) h
+        LEFT JOIN (
+            SELECT DISTINCT user_id, activity_date
+            FROM all_feature_usage
+            WHERE activity_date BETWEEN %s AND %s
+        ) c ON h.user_id = c.user_id AND c.activity_date = ad.activity_date
+        WHERE c.user_id IS NULL
+        GROUP BY ad.activity_date
+        ORDER BY ad.activity_date
+    )
+
+    SELECT * FROM daily_dormant;
+    """
+
+    engine = create_engine(db_url)
+    with engine.connect() as connection:
+        params = [
+            start_date, end_date,  # Analysis period for dates
+            historical_start.date(), analysis_start.date(),  # Historical period for users
+            start_date, end_date,  # Current period for comparison
+        ]
+        df = pd.read_sql_query(query, connection, params=tuple(params))
+        return df
+
+
 def analyze_feature_usage_patterns(comprehensive_df):
     """Analyze feature usage patterns and provide insights"""
     insights = []
@@ -982,7 +1386,7 @@ comprehensive_df = fetch_comprehensive_metrics(start_date, end_date)
 # -------------------------------
 # Main Dashboard - Overview Tab System
 # -------------------------------
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
     [
         "📊 Overview",
         "💰 Spending Analytics",
@@ -990,6 +1394,7 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
         "🏦 Savings Analytics",
         "📈 Investment Analytics",
         "📋 FFP Engagement",
+        "🔍 Customer Feature Analysis",
     ]
 )
 
@@ -1027,7 +1432,7 @@ with tab1:
         # Period-Specific Metrics
         if not comprehensive_df.empty:
             # Row 1: Core Metrics
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2, col3, col4, col5 = st.columns(5)
 
             with col1:
                 st.markdown(
@@ -1072,6 +1477,19 @@ with tab1:
                         "Users active on exactly one day",
                         "azure",
                         "📅",
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+            with col5:
+                churn_kpi = fetch_churn_count(start_date, end_date)
+                st.markdown(
+                    create_metric_card(
+                        "User Churn",
+                        f"{churn_kpi:,}",
+                        f"No activity between {start_date} and {end_date}",
+                        "red",
+                        "📉",
                     ),
                     unsafe_allow_html=True,
                 )
@@ -1137,95 +1555,6 @@ with tab1:
                 )
                 # Use components.html for better HTML rendering
                 components.html(adoption_html, height=200)
-
-
-        # Row 2: Overall Engagement Metrics
-        st.subheader("📊 Overall Engagement Metrics")
-        col_eng1, col_eng2, col_eng3 = st.columns(3)
-        
-        with col_eng1:
-            st.markdown(
-                create_metric_card(
-                    "Average DAU",
-                    f"{comprehensive_df['avg_dau'][0]:,.0f}",
-                    "Average daily active users across all features",
-                    "azure",
-                    "📅",
-                ),
-                unsafe_allow_html=True,
-            )
-        
-        with col_eng2:
-            st.markdown(
-                create_metric_card(
-                    "Average WAU",
-                    f"{comprehensive_df['avg_wau'][0]:,.0f}",
-                    "Average weekly active users across all features",
-                    "azure",
-                    "📆",
-                ),
-                unsafe_allow_html=True,
-            )
-        
-        with col_eng3:
-            st.markdown(
-                create_metric_card(
-                    "Average MAU",
-                    f"{comprehensive_df['avg_mau'][0]:,.0f}",
-                    "Average monthly active users across all features",
-                    "azure",
-                    "🗓️",
-                ),
-                unsafe_allow_html=True,
-            )
-
-        # Row 3: Overall Retention Metrics
-        st.subheader("🔄 Overall Retention Metrics")
-        col_ret1, col_ret2, col_ret3 = st.columns(3)
-        
-        # Fetch overall retention data
-        overall_retention = fetch_retention_metrics(start_date, end_date)
-        
-        if not overall_retention.empty:
-            day1_ret = overall_retention['day1_retention'][0] * 100 if overall_retention['day1_retention'][0] else 0
-            week1_ret = overall_retention['week1_retention'][0] * 100 if overall_retention['week1_retention'][0] else 0
-            month1_ret = overall_retention['month1_retention'][0] * 100 if overall_retention['month1_retention'][0] else 0
-            
-            with col_ret1:
-                st.markdown(
-                    create_metric_card(
-                        "Day 1 Retention",
-                        f"{day1_ret:.1f}%",
-                        "Users returning the next day",
-                        "azure",
-                        "📱",
-                    ),
-                    unsafe_allow_html=True,
-                )
-            
-            with col_ret2:
-                st.markdown(
-                    create_metric_card(
-                        "Week 1 Retention",
-                        f"{week1_ret:.1f}%",
-                        "Users returning within a week",
-                        "azure",
-                        "🗓️",
-                    ),
-                    unsafe_allow_html=True,
-                )
-            
-            with col_ret3:
-                st.markdown(
-                    create_metric_card(
-                        "Month 1 Retention",
-                        f"{month1_ret:.1f}%",
-                        "Users returning within a month",
-                        "azure",
-                        "📊",
-                    ),
-                    unsafe_allow_html=True,
-                )
 
         # Row 4: Enhanced Feature-Specific Metrics with Insights
         st.subheader("🎪 Feature Engagement with Insights")
@@ -1301,6 +1630,166 @@ with tab1:
                 additional_insight=investment_insight
             )
             components.html(investment_html, height=200)
+
+        # Row 2: Overall Engagement Metrics
+        st.subheader("📊 Overall Engagement Metrics")
+        col_eng1, col_eng2, col_eng3 = st.columns(3)
+        
+        with col_eng1:
+            st.markdown(
+                create_metric_card(
+                    "Average DAU",
+                    f"{comprehensive_df['avg_dau'][0]:,.0f}",
+                    "Average daily active users across all features",
+                    "azure",
+                    "📅",
+                ),
+                unsafe_allow_html=True,
+            )
+        
+        with col_eng2:
+            st.markdown(
+                create_metric_card(
+                    "Average WAU",
+                    f"{comprehensive_df['avg_wau'][0]:,.0f}",
+                    "Average weekly active users across all features",
+                    "azure",
+                    "📆",
+                ),
+                unsafe_allow_html=True,
+            )
+        
+        with col_eng3:
+            st.markdown(
+                create_metric_card(
+                    "Average MAU",
+                    f"{comprehensive_df['avg_mau'][0]:,.0f}",
+                    "Average monthly active users across all features",
+                    "azure",
+                    "🗓️",
+                ),
+                unsafe_allow_html=True,
+            )
+
+        # Daily Trend: configurable and polished
+        st.subheader("📈 Daily Trend")
+        trend_df = fetch_overview_trend(start_date, end_date)
+        if not trend_df.empty:
+            metric_display_to_col = {
+                "Signups": "signups",
+                "Active Users": "active_users",
+                "Lady Users": "lady_users",
+                "Spending Users": "spending_users",
+                "Savings Users": "savings_users",
+                "Investment Users": "investment_users",
+            }
+            default_metrics = ["Signups", "Active Users"]
+            selected = st.multiselect(
+                "Select trend lines",
+                options=list(metric_display_to_col.keys()),
+                default=default_metrics,
+                help="Start with core trends, add more to compare engagement",
+            )
+            selected_cols = [metric_display_to_col[m] for m in selected]
+            if selected_cols:
+                base_cols = ["activity_date"] + selected_cols
+                df_plot = trend_df[base_cols].copy()
+
+                # Optional smoothing
+                smooth = st.checkbox("Smooth (7-day rolling)", value=False)
+
+                plot_df = df_plot.melt(
+                    id_vars=["activity_date"],
+                    var_name="metric",
+                    value_name="count",
+                )
+                metric_name_map = {v: k for k, v in metric_display_to_col.items()}
+                plot_df["metric"] = plot_df["metric"].map(metric_name_map)
+                plot_df = plot_df.sort_values(["metric", "activity_date"])  # ensure order for rolling
+                if smooth:
+                    plot_df["count"] = (
+                        plot_df.groupby("metric")["count"].transform(lambda s: s.rolling(7, min_periods=1).mean())
+                    )
+
+                color_map = {
+                    "Signups": LADDER_COLORS["navy"],
+                    "Active Users": LADDER_COLORS["azure"],
+                    "Lady Users": LADDER_COLORS["orange"],
+                    "Spending Users": LADDER_COLORS["blue"],
+                    "Savings Users": LADDER_COLORS["green"],
+                    "Investment Users": LADDER_COLORS["purple"],
+                }
+
+                fig_overview_trend = px.line(
+                    plot_df,
+                    x="activity_date",
+                    y="count",
+                    color="metric",
+                    color_discrete_map=color_map,
+                    markers=True,
+                    labels={"activity_date": "Date", "count": "Users", "metric": ""},
+                )
+                fig_overview_trend.update_traces(line=dict(width=3), marker=dict(size=6, symbol="circle"))
+                fig_overview_trend.update_layout(
+                    hovermode="x unified",
+                    margin=dict(l=0, r=0, t=10, b=0),
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    xaxis_showgrid=False,
+                    yaxis_showgrid=False,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig_overview_trend, use_container_width=True)
+
+
+        # Row 3: Overall Retention Metrics
+        st.subheader("🔄 Overall Retention Metrics")
+        col_ret1, col_ret2, col_ret3 = st.columns(3)
+        
+        # Fetch overall retention data
+        overall_retention = fetch_retention_metrics(start_date, end_date)
+        
+        if not overall_retention.empty:
+            day1_ret = overall_retention['day1_retention'][0] * 100 if overall_retention['day1_retention'][0] else 0
+            week1_ret = overall_retention['week1_retention'][0] * 100 if overall_retention['week1_retention'][0] else 0
+            month1_ret = overall_retention['month1_retention'][0] * 100 if overall_retention['month1_retention'][0] else 0
+            
+            with col_ret1:
+                st.markdown(
+                    create_metric_card(
+                        "Day 1 Retention",
+                        f"{day1_ret:.1f}%",
+                        "Users returning the next day",
+                        "azure",
+                        "📱",
+                    ),
+                    unsafe_allow_html=True,
+                )
+            
+            with col_ret2:
+                st.markdown(
+                    create_metric_card(
+                        "Week 1 Retention",
+                        f"{week1_ret:.1f}%",
+                        "Users returning within a week",
+                        "azure",
+                        "🗓️",
+                    ),
+                    unsafe_allow_html=True,
+                )
+            
+            with col_ret3:
+                st.markdown(
+                    create_metric_card(
+                        "Month 1 Retention",
+                        f"{month1_ret:.1f}%",
+                        "Users returning within a month",
+                        "azure",
+                        "📊",
+                    ),
+                    unsafe_allow_html=True,
+                )
+
         # Row 5: Enhanced Feature Usage Patterns & Analytics
         st.subheader("🎯 Feature Usage Patterns & Analytics")
         
@@ -1569,78 +2058,7 @@ with tab1:
                 unsafe_allow_html=True,
             )
 
-    # Additional Analytics Section
-    st.markdown('<div class="feature-section">', unsafe_allow_html=True)
-    st.subheader("📊 Cross-Feature Comparison")
-
-    if not comprehensive_df.empty:
-        # Create comparison chart
-        feature_data = pd.DataFrame(
-            {
-                "Feature": ["Spending", "Lady AI", "Savings", "Investment"],
-                "Active Users": [
-                    comprehensive_df["spending_users"][0],
-                    comprehensive_df["lady_ai_users"][0],
-                    comprehensive_df["savings_users"][0],
-                    comprehensive_df["investment_users"][0],
-                ],
-                "Colors": [
-                    LADDER_COLORS["blue"],
-                    LADDER_COLORS["orange"],
-                    LADDER_COLORS["green"],
-                    LADDER_COLORS["purple"],
-                ],
-            }
-        )
-
-        fig_comparison = px.bar(
-            feature_data,
-            x="Feature",
-            y="Active Users",
-            title="Feature Adoption Comparison",
-            color="Feature",
-            color_discrete_sequence=feature_data["Colors"],
-        )
-        fig_comparison.update_layout(
-            showlegend=False,
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-        )
-        st.plotly_chart(fig_comparison, use_container_width=True)
-
-        # Feature penetration analysis
-        total_active = comprehensive_df["total_active_users"][0]
-        if total_active > 0:
-            penetration_data = pd.DataFrame(
-                {
-                    "Feature": ["Spending", "Lady AI", "Savings", "Investment"],
-                    "Penetration %": [
-                        (comprehensive_df["spending_users"][0] / total_active) * 100,
-                        (comprehensive_df["lady_ai_users"][0] / total_active) * 100,
-                        (comprehensive_df["savings_users"][0] / total_active) * 100,
-                        (comprehensive_df["investment_users"][0] / total_active) * 100,
-                    ],
-                }
-            )
-
-            fig_penetration = px.pie(
-                penetration_data,
-                values="Penetration %",
-                names="Feature",
-                title="Feature Penetration Among Active Users",
-                color_discrete_sequence=[
-                    LADDER_COLORS["blue"],
-                    LADDER_COLORS["orange"],
-                    LADDER_COLORS["green"],
-                    LADDER_COLORS["purple"],
-                ],
-            )
-            fig_penetration.update_traces(
-                textposition="inside", textinfo="percent+label"
-            )
-            st.plotly_chart(fig_penetration, use_container_width=True)
-
-    st.markdown("</div>", unsafe_allow_html=True)
+    # Cross-Feature Comparison removed per request
 # Feature-specific tabs
 for tab, feature, feature_name in [
     (tab2, "spending", "Spending"),
@@ -1994,6 +2412,269 @@ with tab6:
                 )
         else:
             st.info("No feedback data available for the selected period.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# Customer Feature Analysis Tab
+with tab7:
+    st.markdown('<div class="feature-section">', unsafe_allow_html=True)
+    st.subheader("🔍 Customer Feature Analysis Dashboard")
+    st.markdown(
+        "Identify and analyze users who have used features before but haven't been active recently. "
+        "This helps in understanding user churn patterns and opportunities for re-engagement."
+    )
+
+    # Dormant Period Selection
+    st.subheader("📅 Dormant Period Configuration")
+    col_config1, col_config2 = st.columns(2)
+    
+    with col_config1:
+        dormant_period_options = {
+            "1 Week": 7,
+            "2 Weeks": 14,
+            "1 Month": 30,
+            "2 Months": 60,
+            "3 Months": 90,
+            "Custom": None
+        }
+        
+        dormant_choice = st.selectbox(
+            "⏰ Dormant Period", 
+            list(dormant_period_options.keys()), 
+            index=2,  # Default to 1 Month
+            help="Users who used features before this period but not during the analysis period"
+        )
+    
+    with col_config2:
+        if dormant_choice == "Custom":
+            dormant_period_days = st.number_input(
+                "Custom Dormant Period (Days)", 
+                min_value=1, 
+                max_value=365, 
+                value=30,
+                help="Number of days to look back for historical usage"
+            )
+        else:
+            dormant_period_days = dormant_period_options[dormant_choice]
+
+    # Fetch dormant users analysis
+    dormant_analysis = fetch_dormant_users_analysis(start_date, end_date, dormant_period_days)
+    
+    if not dormant_analysis.empty:
+        # Overall Dormant Users Section
+        st.subheader("📊 Overall Dormant Users Analysis")
+        
+        col_overall1, col_overall2, col_overall3 = st.columns(3)
+        
+        with col_overall1:
+            overall_dormant = dormant_analysis['overall_dormant_users'][0]
+            total_historical = dormant_analysis['total_historical_users'][0]
+            dormant_percentage = (overall_dormant / total_historical * 100) if total_historical > 0 else 0
+            
+            # Determine alert level
+            alert_level = "high" if dormant_percentage > 40 else "medium" if dormant_percentage > 20 else "low"
+            additional_insight = f"Critical: {dormant_percentage:.1f}% of historical users are dormant" if dormant_percentage > 40 else f"Moderate: {dormant_percentage:.1f}% dormant users" if dormant_percentage > 20 else f"Good: Only {dormant_percentage:.1f}% dormant users"
+            
+            overall_html = create_metric_card(
+                "Overall Dormant Users",
+                f"{overall_dormant:,}",
+                f"{dormant_percentage:.1f}% of {total_historical:,} historical users",
+                "red" if dormant_percentage > 40 else "orange" if dormant_percentage > 20 else "green",
+                "😴",
+                alert_level=alert_level,
+                additional_insight=additional_insight
+            )
+            components.html(overall_html, height=200)
+        
+        with col_overall2:
+            total_current = dormant_analysis['total_current_users'][0]
+            reactivation_rate = ((total_current - overall_dormant) / total_historical * 100) if total_historical > 0 else 0
+            
+            alert_level = "low" if reactivation_rate > 60 else "medium" if reactivation_rate > 40 else "high"
+            additional_insight = f"Strong user retention" if reactivation_rate > 60 else f"Moderate retention" if reactivation_rate > 40 else f"Focus on re-engagement"
+            
+            reactivation_html = create_metric_card(
+                "User Reactivation Rate",
+                f"{reactivation_rate:.1f}%",
+                f"Active users from historical base",
+                "green" if reactivation_rate > 60 else "orange" if reactivation_rate > 40 else "red",
+                "🔄",
+                alert_level=alert_level,
+                additional_insight=additional_insight
+            )
+            components.html(reactivation_html, height=200)
+        
+        with col_overall3:
+            # Churn count based on selected date range
+            churn_count = fetch_churn_count(start_date, end_date)
+            churn_html = create_metric_card(
+                "User Churn",
+                f"{churn_count:,}",
+                f"Users with no activity between {start_date} and {end_date}",
+                "red",
+                "📉"
+            )
+            components.html(churn_html, height=200)
+
+        # Feature-Specific Dormant Users Section
+        st.subheader("🎯 Feature-Specific Dormant Users")
+        
+        # Create feature-specific metric cards
+        col_feature1, col_feature2, col_feature3, col_feature4 = st.columns(4)
+        
+        features_data = [
+            ("spending", "Spending", "blue", "💰"),
+            ("savings", "Savings", "green", "🏦"),
+            ("investment", "Investment", "purple", "📈"),
+            ("lady_ai", "Lady AI", "orange", "🤖")
+        ]
+        
+        for i, (feature_key, feature_name, color, icon) in enumerate(features_data):
+            with [col_feature1, col_feature2, col_feature3, col_feature4][i]:
+                dormant_count = dormant_analysis[f'{feature_key}_dormant_users'][0]
+                
+                # Calculate percentage of total dormant users
+                dormant_pct = (dormant_count / overall_dormant * 100) if overall_dormant > 0 else 0
+                
+                alert_level = "high" if dormant_pct > 30 else "medium" if dormant_pct > 15 else "low"
+                additional_insight = f"High {feature_name.lower()} churn" if dormant_pct > 30 else f"Moderate {feature_name.lower()} churn" if dormant_pct > 15 else f"Low {feature_name.lower()} churn"
+                
+                feature_html = create_metric_card(
+                    f"{feature_name} Dormant Users",
+                    f"{dormant_count:,}",
+                    f"{dormant_pct:.1f}% of total dormant users",
+                    color,
+                    icon,
+                    alert_level=alert_level,
+                    additional_insight=additional_insight
+                )
+                components.html(feature_html, height=200)
+
+        # Dormant Users Trend Analysis
+        st.subheader("📈 Dormant Users Trend Over Time")
+        
+        # Fetch trend data
+        dormant_trend = fetch_dormant_users_trend(start_date, end_date, dormant_period_days)
+        
+        if not dormant_trend.empty:
+            # Create trend chart
+            fig_trend = px.line(
+                dormant_trend,
+                x="activity_date",
+                y="dormant_count",
+                title=f"Daily Dormant Users Count ({dormant_period_days}-day lookback)",
+                color_discrete_sequence=[LADDER_COLORS["red"]],
+                markers=True
+            )
+            fig_trend.update_layout(
+                xaxis_title="Date",
+                yaxis_title="Number of Dormant Users",
+                hovermode="x unified",
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+            )
+            st.plotly_chart(fig_trend, use_container_width=True)
+            
+            # Trend insights
+            if len(dormant_trend) > 1:
+                trend_change = dormant_trend['dormant_count'].iloc[-1] - dormant_trend['dormant_count'].iloc[0]
+                trend_direction = "increasing" if trend_change > 0 else "decreasing" if trend_change < 0 else "stable"
+                
+                st.info(f"📊 **Trend Insight**: Dormant users are {trend_direction} by {abs(trend_change):,} users over the analysis period.")
+        else:
+            st.info("No trend data available for the selected period.")
+
+        # Recommendations Section
+        st.subheader("💡 Re-engagement Recommendations")
+        
+        # Generate recommendations based on the data
+        recommendations = []
+        
+        if dormant_percentage > 30:
+            recommendations.append({
+                "title": "High Dormant User Rate",
+                "insight": f"{dormant_percentage:.1f}% of historical users are dormant",
+                "recommendation": "Implement aggressive re-engagement campaigns including email sequences, push notifications, and personalized offers",
+                "icon": "🚨"
+            })
+        
+        # Feature-specific recommendations
+        for feature_key, feature_name, _, _ in features_data:
+            dormant_count = dormant_analysis[f'{feature_key}_dormant_users'][0]
+            dormant_pct = (dormant_count / overall_dormant * 100) if overall_dormant > 0 else 0
+            
+            if dormant_pct > 25:
+                recommendations.append({
+                    "title": f"High {feature_name} Churn",
+                    "insight": f"{dormant_pct:.1f}% of dormant users were {feature_name} users",
+                    "recommendation": f"Focus on {feature_name} feature improvements and targeted re-engagement for {feature_name} users",
+                    "icon": "🎯"
+                })
+        
+        if not recommendations:
+            recommendations.append({
+                "title": "Good User Retention",
+                "insight": "Dormant user rates are within acceptable ranges",
+                "recommendation": "Continue current retention strategies and monitor for any changes",
+                "icon": "✅"
+            })
+        
+        # Display recommendations
+        for rec in recommendations:
+            st.markdown(
+                create_insight_card(
+                    rec["title"],
+                    rec["insight"],
+                    rec["recommendation"],
+                    rec["icon"]
+                ),
+                unsafe_allow_html=True
+            )
+
+        # Detailed Analysis Table
+        with st.expander("📋 Detailed Dormant Users Breakdown", expanded=False):
+            st.markdown("**Comprehensive Dormant Users Analysis**")
+            
+            # Create detailed breakdown table
+            breakdown_data = {
+                'Feature': ['Overall', 'Spending', 'Savings', 'Investment', 'Lady AI'],
+                'Dormant Users': [
+                    dormant_analysis['overall_dormant_users'][0],
+                    dormant_analysis['spending_dormant_users'][0],
+                    dormant_analysis['savings_dormant_users'][0],
+                    dormant_analysis['investment_dormant_users'][0],
+                    dormant_analysis['lady_ai_dormant_users'][0]
+                ],
+                'Percentage of Total Dormant': [
+                    100.0,
+                    (dormant_analysis['spending_dormant_users'][0] / dormant_analysis['overall_dormant_users'][0] * 100) if dormant_analysis['overall_dormant_users'][0] > 0 else 0,
+                    (dormant_analysis['savings_dormant_users'][0] / dormant_analysis['overall_dormant_users'][0] * 100) if dormant_analysis['overall_dormant_users'][0] > 0 else 0,
+                    (dormant_analysis['investment_dormant_users'][0] / dormant_analysis['overall_dormant_users'][0] * 100) if dormant_analysis['overall_dormant_users'][0] > 0 else 0,
+                    (dormant_analysis['lady_ai_dormant_users'][0] / dormant_analysis['overall_dormant_users'][0] * 100) if dormant_analysis['overall_dormant_users'][0] > 0 else 0
+                ]
+            }
+            
+            breakdown_df = pd.DataFrame(breakdown_data)
+            breakdown_df['Percentage of Total Dormant'] = breakdown_df['Percentage of Total Dormant'].round(1)
+            
+            # Style the dataframe
+            def highlight_dormant_rows(row):
+                if row['Dormant Users'] == max(breakdown_df['Dormant Users']):
+                    return ['background-color: #FFE6E6'] * len(row)
+                elif row['Dormant Users'] > breakdown_df['Dormant Users'].mean():
+                    return ['background-color: #FFF2E6'] * len(row)
+                else:
+                    return [''] * len(row)
+            
+            styled_breakdown = breakdown_df.style.apply(highlight_dormant_rows, axis=1)
+            st.dataframe(styled_breakdown, use_container_width=True)
+            
+            # Summary insights
+            st.info(f"📊 **Analysis Summary**: {dormant_analysis['overall_dormant_users'][0]:,} users became dormant during the analysis period. "
+                   f"The feature with the highest dormant user count is {breakdown_df.loc[breakdown_df['Dormant Users'].idxmax(), 'Feature']}.")
+
+    else:
+        st.warning("No dormant users data available for the selected period and configuration.")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
