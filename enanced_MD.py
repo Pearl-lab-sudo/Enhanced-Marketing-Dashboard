@@ -849,7 +849,12 @@ def fetch_overview_trend(start_date, end_date):
         COALESCE(l.lady_users, 0) AS lady_users,
         COALESCE(sp.spending_users, 0) AS spending_users,
         COALESCE(sv.savings_users, 0) AS savings_users,
-        COALESCE(iv.investment_users, 0) AS investment_users
+        COALESCE(iv.investment_users, 0) AS investment_users,
+
+        -- ✅ Absolute cumulative metrics
+        (SELECT COUNT(*) FROM users u WHERE u.restricted = false AND DATE(u.created_at) <= d.dt) AS absolute_signups,
+        (SELECT COUNT(DISTINCT user_id) FROM all_feature_usage afu WHERE afu.activity_date <= d.dt) AS absolute_active_users
+
     FROM days d
     LEFT JOIN signups s ON s.dt = d.dt
     LEFT JOIN active a ON a.dt = d.dt
@@ -1672,9 +1677,13 @@ with tab1:
             )
 
         # Daily Trend: configurable and polished
-        st.subheader("📈 Daily Trend")
+        st.subheader("📈 Usage Trend")
+
         trend_df = fetch_overview_trend(start_date, end_date)
+
         if not trend_df.empty:
+
+            # Metric map including absolute metrics
             metric_display_to_col = {
                 "Signups": "signups",
                 "Active Users": "active_users",
@@ -1682,35 +1691,66 @@ with tab1:
                 "Spending Users": "spending_users",
                 "Savings Users": "savings_users",
                 "Investment Users": "investment_users",
+                "Absolute Signups": "absolute_signups",
+                "Absolute Active Users": "absolute_active_users",
             }
+
             default_metrics = ["Signups", "Active Users"]
+            
             selected = st.multiselect(
                 "Select trend lines",
                 options=list(metric_display_to_col.keys()),
                 default=default_metrics,
-                help="Start with core trends, add more to compare engagement",
+                help="Add/remove trend lines to compare usage behavior"
             )
+
+            # Auto granularity suggestion based on period
+            date_span = (end_date - start_date).days
+            default_granularity = "Monthly" if date_span >= 60 else "Daily"
+
+            granularity = st.radio(
+                "Trend Granularity",
+                ["Daily", "Weekly", "Monthly"],
+                index=["Daily", "Weekly", "Monthly"].index(default_granularity),
+                help="Automatically switches to monthly view when period exceeds 2 months"
+            )
+
             selected_cols = [metric_display_to_col[m] for m in selected]
+
             if selected_cols:
                 base_cols = ["activity_date"] + selected_cols
                 df_plot = trend_df[base_cols].copy()
 
-                # Optional smoothing
+                # ensure datetime
+                df_plot["activity_date"] = pd.to_datetime(df_plot["activity_date"])
+
+                # Resampling based on granularity
+                if granularity == "Weekly":
+                    df_plot = df_plot.resample("W-MON", on="activity_date").sum().reset_index()
+                elif granularity == "Monthly":
+                    df_plot = df_plot.resample("M", on="activity_date").sum().reset_index()
+
+                # Smoothing checkbox + tooltip
                 smooth = st.checkbox("Smooth (7-day rolling)", value=False)
+                st.caption("ℹ️ Smoothing applies a 7-day rolling average to reduce daily noise and highlight trend direction.")
 
                 plot_df = df_plot.melt(
                     id_vars=["activity_date"],
                     var_name="metric",
                     value_name="count",
                 )
+
                 metric_name_map = {v: k for k, v in metric_display_to_col.items()}
                 plot_df["metric"] = plot_df["metric"].map(metric_name_map)
-                plot_df = plot_df.sort_values(["metric", "activity_date"])  # ensure order for rolling
-                if smooth:
+                plot_df = plot_df.sort_values(["metric", "activity_date"])
+
+                if smooth and granularity == "Daily": 
                     plot_df["count"] = (
-                        plot_df.groupby("metric")["count"].transform(lambda s: s.rolling(7, min_periods=1).mean())
+                        plot_df.groupby("metric")["count"]
+                        .transform(lambda s: s.rolling(7, min_periods=1).mean())
                     )
 
+                # Chart styling
                 color_map = {
                     "Signups": LADDER_COLORS["navy"],
                     "Active Users": LADDER_COLORS["azure"],
@@ -1718,6 +1758,8 @@ with tab1:
                     "Spending Users": LADDER_COLORS["blue"],
                     "Savings Users": LADDER_COLORS["green"],
                     "Investment Users": LADDER_COLORS["purple"],
+                    "Absolute Signups": LADDER_COLORS["navy"],
+                    "Absolute Active Users": LADDER_COLORS["azure"],
                 }
 
                 fig_overview_trend = px.line(
@@ -1729,7 +1771,11 @@ with tab1:
                     markers=True,
                     labels={"activity_date": "Date", "count": "Users", "metric": ""},
                 )
-                fig_overview_trend.update_traces(line=dict(width=3), marker=dict(size=6, symbol="circle"))
+
+                fig_overview_trend.update_traces(
+                    line=dict(width=3),
+                    marker=dict(size=6, symbol="circle")
+                )
                 fig_overview_trend.update_layout(
                     hovermode="x unified",
                     margin=dict(l=0, r=0, t=10, b=0),
@@ -1737,10 +1783,10 @@ with tab1:
                     paper_bgcolor="rgba(0,0,0,0)",
                     xaxis_showgrid=False,
                     yaxis_showgrid=False,
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
                 )
-                st.plotly_chart(fig_overview_trend, use_container_width=True)
 
+                st.plotly_chart(fig_overview_trend, use_container_width=True)
 
         # Row 3: Overall Retention Metrics
         st.subheader("🔄 Overall Retention Metrics")
@@ -2703,5 +2749,4 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
-
 
