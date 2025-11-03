@@ -40,9 +40,77 @@ FEATURE_COLORS = {
 }
 
 # -------------------------------
+# Streamlit App Configuration (must be first Streamlit call)
+# -------------------------------
+st.set_page_config(
+    page_title="📊 Ladder Marketing Analytics",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# -------------------------------
 # Load credentials
 # -------------------------------
 load_dotenv()
+# """
+# Authentication gate: Require password from secrets or environment before loading the dashboard UI.
+# Checks Streamlit secrets first (for cloud deployments) and falls back to environment variables.
+# """
+def require_password():
+    # Prefer Streamlit Cloud secrets, fall back to environment variables
+    password = None
+    try:
+        if "MARKETING_DASHBOARD_PASSWORD" in st.secrets:
+            password = st.secrets["MARKETING_DASHBOARD_PASSWORD"]
+        elif "DASHBOARD_PASSWORD" in st.secrets:
+            password = st.secrets["DASHBOARD_PASSWORD"]
+    except Exception:
+        pass
+
+    if not password:
+        password = os.getenv("MARKETING_DASHBOARD_PASSWORD") or os.getenv("DASHBOARD_PASSWORD")
+    if not password:
+        st.error("Dashboard password not configured. Set MARKETING_DASHBOARD_PASSWORD or use Streamlit secrets.")
+        st.stop()
+
+    if "authenticated_marketing" not in st.session_state:
+        st.session_state.authenticated_marketing = False
+
+    if not st.session_state.authenticated_marketing:
+        # Pleasant, friendly lock screen UI for the marketing team
+        st.markdown(
+            f"""
+<div style="display: flex; align-items: center; justify-content: center; min-height: 75vh;">
+  <div style="max-width: 460px; width: 100%; background: linear-gradient(135deg, {LADDER_COLORS['white']}, {LADDER_COLORS['light_gray']}); padding: 28px; border-radius: 18px; box-shadow: 0 12px 30px rgba(0,0,0,0.08); border-left: 6px solid {LADDER_COLORS['orange']};">
+    <div style="text-align: center; margin-bottom: 8px;">
+      <div style="font-size: 40px;">🔐</div>
+      <h2 style="margin: 6px 0 0 0; color: {LADDER_COLORS['navy']};">Welcome to Marketing Analytics</h2>
+      <p style="margin: 6px 0 0 0; color: {LADDER_COLORS['dark_gray']}; font-size: 14px;">Please enter your access password to continue.</p>
+    </div>
+  </div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+        with st.container():
+            st.markdown("<div style='height: 8px'></div>", unsafe_allow_html=True)
+            entered_password = st.text_input("Password", type="password", key="marketing_pwd")
+            submit = st.button("Unlock dashboard", type="primary")
+
+        if submit:
+            if entered_password == password:
+                st.session_state.authenticated_marketing = True
+                st.success("Access granted. Loading dashboard…")
+                st.rerun()
+            else:
+                st.warning("That password doesn’t look right. Please try again.")
+
+        st.stop()
+
+
+# Enforce authentication before rendering any part of the dashboard
+require_password()
 DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST")
@@ -1392,14 +1460,8 @@ def generate_insights(metrics_df, retention_df, feature=None):
 
 
 # -------------------------------
-# Streamlit App Configuration
+# App Styling
 # -------------------------------
-st.set_page_config(
-    page_title="📊 Ladder Marketing Analytics",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
 apply_custom_css()
 
 # Header
@@ -2864,4 +2926,3 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
-
