@@ -2338,7 +2338,7 @@ for tab, feature, feature_name in [
                 st.markdown(
                     create_metric_card(
                         "One Time Usage Users",
-                        f"{feature_metrics[''one_time_usage_users'][0]:,}",
+                        f"{feature_metrics['first_time_users'][0]:,}",
                         f"Users active on exactly one day in {feature_name.lower()}",
                         feature_color,
                         "📅",
@@ -2926,4 +2926,5 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
+
 
