@@ -5,4 +5,5 @@ sqlalchemy
 python-dotenv
 psycopg2-binary
 numpy
+altair==4.2.2
 pyarrow
